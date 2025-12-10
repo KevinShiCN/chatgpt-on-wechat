@@ -52,6 +52,108 @@ def split_string_by_utf8_length(string, max_length, max_split=0):
     return result
 
 
+def split_markdown_by_length(content, max_length=2048):
+    """
+    智能切分 Markdown 内容，避免在 HTML 标签或 Markdown 语法中间切断
+
+    Args:
+        content: 待切分的 Markdown 内容
+        max_length: 最大字节长度，默认 2048
+
+    Returns:
+        切分后的字符串列表
+    """
+    if len(content.encode('utf-8')) <= max_length:
+        return [content]
+
+    result = []
+    current_chunk = ""
+
+    # 按行切分，保持内容完整性
+    lines = content.split('\n')
+
+    for i, line in enumerate(lines):
+        line_with_newline = line + ('\n' if i < len(lines) - 1 else '')
+        test_chunk = current_chunk + line_with_newline
+        test_bytes = test_chunk.encode('utf-8')
+
+        # 如果加上这行后超过限制
+        if len(test_bytes) > max_length:
+            # 如果当前块不为空，先保存
+            if current_chunk:
+                # 移除末尾的换行符，避免产生空行
+                result.append(current_chunk.rstrip('\n'))
+                current_chunk = line_with_newline
+            else:
+                # 单行就超过限制，需要强制切分
+                # 但要避免在 HTML 标签中间切分
+                parts = _split_long_line_safely(line, max_length)
+                result.extend(parts[:-1])
+                current_chunk = parts[-1] + ('\n' if i < len(lines) - 1 else '')
+        else:
+            current_chunk = test_chunk
+
+    # 添加最后一块
+    if current_chunk:
+        result.append(current_chunk.rstrip('\n'))
+
+    return result
+
+
+def _split_long_line_safely(line, max_length):
+    """
+    安全地切分过长的单行，避免在 HTML 标签中间切断
+
+    Args:
+        line: 待切分的行
+        max_length: 最大字节长度
+
+    Returns:
+        切分后的字符串列表
+    """
+    if len(line.encode('utf-8')) <= max_length:
+        return [line]
+
+    result = []
+    current = ""
+    i = 0
+
+    while i < len(line):
+        char = line[i]
+
+        # 检测到 HTML 标签开始
+        if char == '<':
+            # 找到标签结束位置
+            tag_end = line.find('>', i)
+            if tag_end != -1:
+                tag = line[i:tag_end + 1]
+                test = current + tag
+
+                # 如果加上整个标签后超过限制
+                if len(test.encode('utf-8')) > max_length and current:
+                    result.append(current)
+                    current = tag
+                else:
+                    current = test
+                i = tag_end + 1
+                continue
+
+        # 普通字符
+        test = current + char
+        if len(test.encode('utf-8')) > max_length and current:
+            result.append(current)
+            current = char
+        else:
+            current = test
+        i += 1
+
+    if current:
+        result.append(current)
+
+    return result if result else [line[:max_length]]
+
+
+
 def get_path_suffix(path):
     path = urlparse(path).path
     return os.path.splitext(path)[-1].lstrip('.')

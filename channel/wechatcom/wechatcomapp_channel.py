@@ -17,7 +17,7 @@ from channel.wechatcom.wechatcomapp_client import WechatComAppClient
 from channel.wechatcom.wechatcomapp_message import WechatComAppMessage
 from common.log import logger
 from common.singleton import singleton
-from common.utils import compress_imgfile, fsize, split_string_by_utf8_length, convert_webp_to_png, remove_markdown_symbol
+from common.utils import compress_imgfile, fsize, split_string_by_utf8_length, convert_webp_to_png, remove_markdown_symbol, split_markdown_by_length
 from config import conf, subscribe_msg
 from voice.audio_convert import any_to_amr, split_audio
 
@@ -49,18 +49,49 @@ class WechatComAppChannel(ChatChannel):
         port = conf().get("wechatcomapp_port", 9898)
         web.httpserver.runsimple(app.wsgifunc(), ("0.0.0.0", port))
 
+    def _send_markdown(self, receiver, content):
+        """发送 Markdown 消息"""
+        try:
+            # 使用企业微信的 markdown 消息类型
+            url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={self.client.access_token}"
+            data = {
+                "touser": receiver,
+                "msgtype": "markdown",
+                "agentid": self.agent_id,
+                "markdown": {
+                    "content": content
+                }
+            }
+            response = requests.post(url, json=data)
+            result = response.json()
+            if result.get("errcode") != 0:
+                logger.error(f"[wechatcom] send markdown failed: {result}")
+                # 如果 markdown 发送失败，降级为文本消息
+                plain_text = remove_markdown_symbol(content)
+                self.client.message.send_text(self.agent_id, receiver, plain_text)
+            else:
+                logger.debug(f"[wechatcom] send markdown success: {result}")
+        except Exception as e:
+            logger.error(f"[wechatcom] send markdown error: {e}")
+            # 发生异常时降级为文本消息
+            plain_text = remove_markdown_symbol(content)
+            self.client.message.send_text(self.agent_id, receiver, plain_text)
+
     def send(self, reply: Reply, context: Context):
         receiver = context["receiver"]
         if reply.type in [ReplyType.TEXT, ReplyType.ERROR, ReplyType.INFO]:
-            reply_text = remove_markdown_symbol(reply.content)
-            texts = split_string_by_utf8_length(reply_text, MAX_UTF8_LEN)
+            # 保留原始内容用于发送 Markdown
+            reply_content = reply.content
+            # 使用智能切分，避免在 HTML 标签中间切断
+            texts = split_markdown_by_length(reply_content, MAX_UTF8_LEN)
             if len(texts) > 1:
-                logger.info("[wechatcom] text too long, split into {} parts".format(len(texts)))
+                logger.info("[wechatcom] markdown too long, split into {} parts".format(len(texts)))
             for i, text in enumerate(texts):
-                self.client.message.send_text(self.agent_id, receiver, text)
+                # 使用 Markdown 消息类型
+                self._send_markdown(receiver, text)
                 if i != len(texts) - 1:
                     time.sleep(0.5)  # 休眠0.5秒，防止发送过快乱序
-            logger.info("[wechatcom] Do send text to {}: {}".format(receiver, reply_text))
+            logger.info("[wechatcom] Do send markdown to {}: {} chars".format(receiver, len(reply_content)))
         elif reply.type == ReplyType.VOICE:
             try:
                 media_ids = []
@@ -160,6 +191,7 @@ class Query:
             raise web.Forbidden()
         msg = parse_message(message)
         logger.debug("[wechatcom] receive message: {}, msg= {}".format(message, msg))
+        logger.info(f"[wechatcom] receive message type: {msg.type}")  # 添加消息类型日志
         if msg.type == "event":
             if msg.event == "subscribe":
                 pass
@@ -172,7 +204,7 @@ class Query:
             try:
                 wechatcom_msg = WechatComAppMessage(msg, client=channel.client)
             except NotImplementedError as e:
-                logger.debug("[wechatcom] " + str(e))
+                logger.info("[wechatcom] Unsupported message type: " + str(e))  # 改为 info 级别
                 return "success"
             context = channel._compose_context(
                 wechatcom_msg.ctype,

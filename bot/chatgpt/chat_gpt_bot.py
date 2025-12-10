@@ -1,6 +1,8 @@
 # encoding:utf-8
 
 import time
+import base64
+import os
 
 import openai
 import openai.error
@@ -37,13 +39,15 @@ class ChatGPTBot(Bot, OpenAIImage):
         self.args = {
             "model": conf_model,  # 对话模型的名称
             "temperature": conf().get("temperature", 0.9),  # 值在[0,1]之间，越大表示回复越具有不确定性
-            # "max_tokens":4096,  # 回复最大的字符数
             "top_p": conf().get("top_p", 1),
             "frequency_penalty": conf().get("frequency_penalty", 0.0),  # [-2,2]之间，该值越大则更倾向于产生不同的内容
             "presence_penalty": conf().get("presence_penalty", 0.0),  # [-2,2]之间，该值越大则更倾向于产生不同的内容
             "request_timeout": conf().get("request_timeout", None),  # 请求超时时间，openai接口默认设置为600，对于难问题一般需要较长时间
             "timeout": conf().get("request_timeout", None),  # 重试超时时间，在这个时间内，将会自动重试
         }
+        # 如果配置了max_tokens，则添加到参数中
+        if conf().get("max_tokens"):
+            self.args["max_tokens"] = conf().get("max_tokens")
         # 部分模型暂不支持一些参数，特殊处理
         if conf_model in [const.O1, const.O1_MINI, const.GPT_5, const.GPT_5_MINI, const.GPT_5_NANO]:
             remove_keys = ["temperature", "top_p", "frequency_penalty", "presence_penalty"]
@@ -103,6 +107,33 @@ class ChatGPTBot(Bot, OpenAIImage):
                 logger.debug("[CHATGPT] reply {} used 0 tokens.".format(reply_content))
             return reply
 
+        elif context.type == ContextType.IMAGE:
+            # 处理图片识别
+            logger.info("[CHATGPT] image query")
+            session_id = context["session_id"]
+            img_path = context.content  # 图片文件路径
+
+            # 检查是否有合并的文本提问
+            if context.get("img_query"):
+                query_text = context["img_query"]
+                logger.info(f"[CHATGPT] using merged text query: {query_text[:50]}...")
+            else:
+                # 使用默认提示，让 AI 根据会话历史自行判断用户意图
+                query_text = "请分析这张图片"
+
+            try:
+                reply_content = self.reply_image(img_path, query_text, session_id, context)
+                if reply_content.get("completion_tokens", 0) > 0:
+                    self.sessions.session_reply(reply_content["content"], session_id, reply_content["total_tokens"])
+                    reply = Reply(ReplyType.TEXT, reply_content["content"])
+                else:
+                    reply = Reply(ReplyType.ERROR, reply_content.get("content", "图片识别失败"))
+            except Exception as e:
+                logger.exception(f"[CHATGPT] Image recognition error: {e}")
+                reply = Reply(ReplyType.ERROR, f"图片识别出错：{str(e)}")
+
+            return reply
+
         elif context.type == ContextType.IMAGE_CREATE:
             ok, retstring = self.create_img(query, 0)
             reply = None
@@ -111,6 +142,34 @@ class ChatGPTBot(Bot, OpenAIImage):
             else:
                 reply = Reply(ReplyType.ERROR, retstring)
             return reply
+
+        elif context.type == ContextType.VIDEO:
+            # 处理视频识别
+            logger.info("[CHATGPT] video query")
+            session_id = context["session_id"]
+            video_path = context.content  # 视频文件路径
+
+            # 检查是否有合并的文本提问
+            if context.get("video_query"):
+                query_text = context["video_query"]
+                logger.info(f"[CHATGPT] using merged text query: {query_text[:50]}...")
+            else:
+                # 使用默认提示，让 AI 根据会话历史自行判断用户意图
+                query_text = "请分析这个视频"
+
+            try:
+                reply_content = self.reply_video(video_path, query_text, session_id, context)
+                if reply_content.get("completion_tokens", 0) > 0:
+                    self.sessions.session_reply(reply_content["content"], session_id, reply_content["total_tokens"])
+                    reply = Reply(ReplyType.TEXT, reply_content["content"])
+                else:
+                    reply = Reply(ReplyType.ERROR, reply_content.get("content", "视频识别失败"))
+            except Exception as e:
+                logger.exception(f"[CHATGPT] Video recognition error: {e}")
+                reply = Reply(ReplyType.ERROR, f"视频识别出错：{str(e)}")
+
+            return reply
+
         else:
             reply = Reply(ReplyType.ERROR, "Bot不支持处理{}类型的消息".format(context.type))
             return reply
@@ -170,6 +229,192 @@ class ChatGPTBot(Bot, OpenAIImage):
                 return self.reply_text(session, api_key, args, retry_count + 1)
             else:
                 return result
+
+    def reply_image(self, img_path, query_text, session_id, context, api_key=None, retry_count=0) -> dict:
+        """
+        处理图片识别请求
+        :param img_path: 图片文件路径
+        :param query_text: 用户的文字提问
+        :param session_id: 会话ID
+        :param context: 上下文
+        :param api_key: API密钥
+        :param retry_count: 重试次数
+        :return: dict
+        """
+        try:
+            logger.info(f"[CHATGPT] Image recognition: img_path={img_path}, query={query_text}")
+
+            # 读取图片并转换为 base64
+            with open(img_path, "rb") as img_file:
+                img_data = img_file.read()
+                base64_image = base64.b64encode(img_data).decode('utf-8')
+
+            # 确定图片的 MIME 类型
+            img_ext = os.path.splitext(img_path)[1].lower()
+            mime_types = {
+                '.jpg': 'image/jpeg',
+                '.jpeg': 'image/jpeg',
+                '.png': 'image/png',
+                '.gif': 'image/gif',
+                '.webp': 'image/webp'
+            }
+            mime_type = mime_types.get(img_ext, 'image/jpeg')
+
+            # 获取会话历史
+            session = self.sessions.build_session(session_id)
+
+            # 构造包含图片的消息 - 使用 Vision API 格式
+            messages = session.messages.copy() if hasattr(session, 'messages') else []
+            messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": query_text
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{base64_image}"
+                        }
+                    }
+                ]
+            })
+
+            # 调用 API
+            if api_key is None:
+                api_key = context.get("openai_api_key")
+
+            args = self.args.copy()
+            # Vision API 可能需要调整参数
+            if 'max_tokens' not in args:
+                args['max_tokens'] = 4096
+
+            response = openai.ChatCompletion.create(
+                api_key=api_key,
+                messages=messages,
+                **args
+            )
+
+            reply_content = response.choices[0]["message"]["content"]
+            total_tokens = response["usage"]["total_tokens"]
+            completion_tokens = response["usage"]["completion_tokens"]
+
+            logger.info(f"[CHATGPT] Image reply={reply_content}, total_tokens={total_tokens}")
+
+            return {
+                "total_tokens": total_tokens,
+                "completion_tokens": completion_tokens,
+                "content": reply_content,
+            }
+
+        except Exception as e:
+            logger.exception(f"[CHATGPT] Image recognition exception: {e}")
+            need_retry = retry_count < 2
+
+            if need_retry:
+                logger.warn(f"[CHATGPT] Image recognition retry {retry_count + 1}")
+                time.sleep(5)
+                return self.reply_image(img_path, query_text, session_id, context, api_key, retry_count + 1)
+            else:
+                return {
+                    "total_tokens": 0,
+                    "completion_tokens": 0,
+                    "content": f"图片识别失败：{str(e)}"
+                }
+
+    def reply_video(self, video_path, query_text, session_id, context, api_key=None, retry_count=0) -> dict:
+        """
+        处理视频识别请求（使用 Vision API）
+        :param video_path: 视频文件路径
+        :param query_text: 用户的文字提问
+        :param session_id: 会话ID
+        :param context: 上下文
+        :param api_key: API密钥
+        :param retry_count: 重试次数
+        :return: dict
+        """
+        try:
+            logger.info(f"[CHATGPT] Video recognition: video_path={video_path}, query={query_text}")
+
+            # 读取视频并转换为 base64
+            with open(video_path, "rb") as video_file:
+                video_data = video_file.read()
+                base64_video = base64.b64encode(video_data).decode('utf-8')
+
+            # 确定视频的 MIME 类型
+            video_ext = os.path.splitext(video_path)[1].lower()
+            mime_types = {
+                '.mp4': 'video/mp4',
+                '.avi': 'video/x-msvideo',
+                '.mov': 'video/quicktime',
+                '.wmv': 'video/x-ms-wmv',
+                '.flv': 'video/x-flv',
+                '.mkv': 'video/x-matroska'
+            }
+            mime_type = mime_types.get(video_ext, 'video/mp4')
+
+            # 获取会话历史
+            session = self.sessions.build_session(session_id)
+
+            # 构造包含视频的消息 - 使用 Vision API 格式（类似图片）
+            messages = session.messages.copy() if hasattr(session, 'messages') else []
+            messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": query_text
+                    },
+                    {
+                        "type": "image_url",  # 使用 image_url 类型，但传视频
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{base64_video}"
+                        }
+                    }
+                ]
+            })
+
+            # 调用 API
+            if api_key is None:
+                api_key = context.get("openai_api_key")
+
+            args = self.args.copy()
+            if 'max_tokens' not in args:
+                args['max_tokens'] = 4096
+
+            response = openai.ChatCompletion.create(
+                api_key=api_key,
+                messages=messages,
+                **args
+            )
+
+            reply_content = response.choices[0]["message"]["content"]
+            total_tokens = response["usage"]["total_tokens"]
+            completion_tokens = response["usage"]["completion_tokens"]
+
+            logger.info(f"[CHATGPT] Video reply={reply_content}, total_tokens={total_tokens}")
+
+            return {
+                "total_tokens": total_tokens,
+                "completion_tokens": completion_tokens,
+                "content": reply_content,
+            }
+
+        except Exception as e:
+            logger.exception(f"[CHATGPT] Video recognition exception: {e}")
+            need_retry = retry_count < 2
+
+            if need_retry:
+                logger.warn(f"[CHATGPT] Video recognition retry {retry_count + 1}")
+                time.sleep(5)
+                return self.reply_video(video_path, query_text, session_id, context, api_key, retry_count + 1)
+            else:
+                return {
+                    "total_tokens": 0,
+                    "completion_tokens": 0,
+                    "content": f"视频识别失败：{str(e)}"
+                }
 
 
 class AzureChatGPTBot(ChatGPTBot):

@@ -44,6 +44,21 @@ class WechatComAppMessage(ChatMessage):
                     logger.info(f"[wechatcom] Failed to download image file, {response.content}")
 
             self._prepare_fn = download_image
+        elif msg.type == "video":
+            self.ctype = ContextType.VIDEO
+            self.content = TmpDir().path() + msg.media_id + ".mp4"  # content直接存临时目录路径
+
+            def download_video():
+                # 下载视频文件
+                response = client.media.download(msg.media_id)
+                if response.status_code == 200:
+                    with open(self.content, "wb") as f:
+                        f.write(response.content)
+                    logger.info(f"[wechatcom] Video downloaded: {self.content}")
+                else:
+                    logger.info(f"[wechatcom] Failed to download video file, {response.content}")
+
+            self._prepare_fn = download_video
         else:
             raise NotImplementedError("Unsupported message type: Type:{} ".format(msg.type))
 

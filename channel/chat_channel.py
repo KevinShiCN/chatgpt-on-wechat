@@ -20,6 +20,25 @@ except Exception as e:
 handler_pool = ThreadPoolExecutor(max_workers=8)  # 处理消息的线程池
 
 
+# 消息去重缓存（防止重复处理同一条消息）
+processed_messages = {}  # {msg_id: timestamp}
+MESSAGE_EXPIRY = 300  # 消息ID缓存过期时间（秒）
+
+# 待处理的文本消息（等待可能的图片）
+pending_text_messages = {}  # {session_id: {"context": context, "time": timestamp, "future": future, "reply": reply, "cancelled": False}}
+TEXT_WAIT_TIME = 20  # 等待图片的时间（秒）
+
+
+def cleanup_expired_cache():
+    """清理过期的缓存"""
+    current_time = time.time()
+    # 清理消息ID缓存
+    expired_msgs = [msg_id for msg_id, timestamp in processed_messages.items()
+                    if current_time - timestamp > MESSAGE_EXPIRY]
+    for msg_id in expired_msgs:
+        del processed_messages[msg_id]
+
+
 # 抽象类, 它包含了与消息通道无关的通用处理逻辑
 class ChatChannel(Channel):
     name = None  # 登录的用户名
@@ -166,6 +185,25 @@ class ChatChannel(Channel):
     def _handle(self, context: Context):
         if context is None or not context.content:
             return
+
+        # 消息去重检查
+        msg_id = None
+        if context.get("msg"):
+            msg_id = getattr(context["msg"], "msg_id", None) or getattr(context["msg"], "id", None)
+
+        if msg_id:
+            # 检查是否已处理过
+            if msg_id in processed_messages:
+                logger.warning(f"[chat_channel] duplicate message detected, skip: {msg_id}")
+                return
+
+            # 记录消息ID
+            processed_messages[msg_id] = time.time()
+
+            # 定期清理过期缓存（每100条消息清理一次）
+            if len(processed_messages) % 100 == 0:
+                cleanup_expired_cache()
+
         logger.debug("[chat_channel] ready to handle context: {}".format(context))
         # reply的构建步骤
         reply = self._generate_reply(context)
@@ -190,8 +228,69 @@ class ChatChannel(Channel):
         if not e_context.is_pass():
             logger.debug("[chat_channel] ready to handle context: type={}, content={}".format(context.type, context.content))
             if context.type == ContextType.TEXT or context.type == ContextType.IMAGE_CREATE:  # 文字和图片消息
-                context["channel"] = e_context["channel"]
-                reply = super().build_reply_content(context.content, context)
+                if context.type == ContextType.TEXT:
+                    # 文本消息延迟处理，等待可能的图片
+                    session_id = context.get("session_id")
+
+                    # 检查是否有待处理的图片消息正在等待文本
+                    if session_id and session_id in pending_text_messages:
+                        # 有待处理的文本，说明这是新的文本消息，取消之前的
+                        old_pending = pending_text_messages[session_id]
+                        if "future" in old_pending and not old_pending["future"].done():
+                            old_pending["future"].cancel()
+                            logger.info("[chat_channel] cancelled previous pending text message")
+
+                    # 立即开始处理文本消息（异步）
+                    logger.info(f"[chat_channel] text message received, start processing immediately and wait {TEXT_WAIT_TIME}s for possible image...")
+
+                    def immediate_text_handler():
+                        # 立即处理文本消息
+                        pending_context = context
+                        pending_context["channel"] = e_context["channel"]
+
+                        logger.info("[chat_channel] processing text message immediately...")
+                        text_reply = super(ChatChannel, self).build_reply_content(pending_context.content, pending_context)
+
+                        # 保存处理结果
+                        if session_id in pending_text_messages:
+                            pending_text_messages[session_id]["reply"] = text_reply
+
+                        # 等待指定时间，看是否有图片到来
+                        time.sleep(TEXT_WAIT_TIME)
+
+                        # 检查是否被取消（被图片消息取消）
+                        if session_id in pending_text_messages and not pending_text_messages[session_id].get("cancelled", False):
+                            # 没有被取消，发送之前处理好的回复
+                            logger.info("[chat_channel] no image received within timeout, sending text reply")
+                            del pending_text_messages[session_id]
+
+                            if text_reply and text_reply.content:
+                                text_reply = self._decorate_reply(pending_context, text_reply)
+                                self._send_reply(pending_context, text_reply)
+                        else:
+                            # 被取消了，说明收到了图片，图片处理会合并文本
+                            logger.info("[chat_channel] text message was merged with image, skip sending")
+                            if session_id in pending_text_messages:
+                                del pending_text_messages[session_id]
+
+                    # 保存待处理的文本消息
+                    pending_text_messages[session_id] = {
+                        "context": context,
+                        "time": time.time(),
+                        "reply": None,
+                        "cancelled": False
+                    }
+
+                    # 提交立即处理任务
+                    future = handler_pool.submit(immediate_text_handler)
+                    pending_text_messages[session_id]["future"] = future
+
+                    # 不返回 reply，由异步任务处理
+                    return Reply()
+                else:
+                    # IMAGE_CREATE 类型正常处理
+                    context["channel"] = e_context["channel"]
+                    reply = super().build_reply_content(context.content, context)
             elif context.type == ContextType.VOICE:  # 语音消息
                 cmsg = context["msg"]
                 cmsg.prepare()
@@ -219,14 +318,78 @@ class ChatChannel(Channel):
                         reply = self._generate_reply(new_context)
                     else:
                         return
-            elif context.type == ContextType.IMAGE:  # 图片消息，当前仅做下载保存到本地的逻辑
-                memory.USER_IMAGE_CACHE[context["session_id"]] = {
+            elif context.type == ContextType.IMAGE:  # 图片消息，进行图片识别
+                session_id = context.get("session_id")
+
+                # 检查是否有待处理的文本消息
+                text_query = None
+                if session_id and session_id in pending_text_messages:
+                    # 有待处理的文本，合并处理
+                    pending = pending_text_messages[session_id]
+                    text_context = pending["context"]
+                    text_query = text_context.content
+
+                    logger.info(f"[chat_channel] found pending text message, merging with image: {text_query[:50]}...")
+
+                    # 取消延迟任务
+                    if "future" in pending and not pending["future"].done():
+                        pending["future"].cancel()
+
+                    # 从待处理队列中移除
+                    del pending_text_messages[session_id]
+
+                # 保存图片到缓存（用于某些插件）
+                memory.USER_IMAGE_CACHE[session_id] = {
                     "path": context.content,
-                    "msg": context.get("msg")
+                    "msg": context.get("msg"),
+                    "time": time.time()
                 }
+
+                # 调用 bot 进行图片识别
+                logger.info("[chat_channel] processing image message: {}".format(context.content))
+                cmsg = context["msg"]
+                cmsg.prepare()  # 确保图片已下载
+
+                # 如果有文本，将其传递给 bot
+                if text_query:
+                    context["img_query"] = text_query
+
+                context["channel"] = e_context["channel"]
+                reply = super().build_reply_content(context.content, context)
+            elif context.type == ContextType.VIDEO:  # 视频消息，进行视频识别
+                session_id = context.get("session_id")
+
+                # 检查是否有待处理的文本消息
+                text_query = None
+                if session_id and session_id in pending_text_messages:
+                    # 有待处理的文本，合并处理
+                    pending = pending_text_messages[session_id]
+                    text_context = pending["context"]
+                    text_query = text_context.content
+
+                    logger.info(f"[chat_channel] found pending text message, merging with video: {text_query[:50]}...")
+
+                    # 取消延迟任务
+                    if "future" in pending and not pending["future"].done():
+                        pending["future"].cancel()
+
+                    # 从待处理队列中移除
+                    del pending_text_messages[session_id]
+
+                # 调用 bot 进行视频识别
+                logger.info("[chat_channel] processing video message: {}".format(context.content))
+                cmsg = context["msg"]
+                cmsg.prepare()  # 确保视频已下载
+
+                # 如果有文本，将其传递给 bot
+                if text_query:
+                    context["video_query"] = text_query
+
+                context["channel"] = e_context["channel"]
+                reply = super().build_reply_content(context.content, context)
             elif context.type == ContextType.SHARING:  # 分享信息，当前无默认逻辑
                 pass
-            elif context.type == ContextType.FUNCTION or context.type == ContextType.FILE:  # 文件消息及函数调用等，当前无默认逻辑
+            elif context.type == ContextType.FUNCTION:  # 函数调用等，当前无默认逻辑
                 pass
             else:
                 logger.warning("[chat_channel] unknown context type: {}".format(context.type))

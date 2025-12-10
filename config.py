@@ -64,6 +64,7 @@ available_setting = {
     "top_p": 1,
     "frequency_penalty": 0,
     "presence_penalty": 0,
+    "max_tokens": None,  # 生成的最大token数，None表示不限制
     "request_timeout": 180,  # chatgpt请求超时时间，openai接口默认设置为600，对于难问题一般需要较长时间
     "timeout": 120,  # chatgpt重试超时时间，在这个时间内，将会自动重试
     # Baidu 文心一言参数

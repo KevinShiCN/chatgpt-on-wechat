@@ -1,0 +1,33 @@
+# 自动检测文本文件并规范换行符
+* text=auto
+
+# Python文件使用LF
+*.py text eol=lf
+
+# Shell脚本使用LF
+*.sh text eol=lf
+
+# YAML文件使用LF
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# JSON文件使用LF
+*.json text eol=lf
+
+# Markdown文件使用LF
+*.md text eol=lf
+
+# 配置文件使用LF
+.flake8 text eol=lf
+.gitignore text eol=lf
+
+# 二进制文件不转换
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary

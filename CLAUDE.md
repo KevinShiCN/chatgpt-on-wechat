@@ -7,8 +7,13 @@
 基于大模型的智能聊天机器人，支持微信、企业微信、公众号等多个平台。
 
 **仓库地址**:
-- GitHub: https://github.com/KevinShiCN/chatgpt-on-wechat
-- Gitee（镜像）: https://gitee.com/kevinshicn/chatgpt-on-wechat
+- GitHub（主仓库）: https://github.com/KevinShiCN/chatgpt-on-wechat
+- Gitee（同步仓库，私有）: https://gitee.com/kevinshicn/chatgpt-on-wechat
+
+**重要说明**：
+- 本服务器只与 Gitee 连接（因 GitHub 网络不稳定）
+- 其他设备配置双推送：GitHub + Gitee
+- Gitee 作为中转/同步仓库
 
 ## 重要变更
 
@@ -17,10 +22,14 @@
 为解决敏感配置文件（`config.json`）在多服务器间同步的问题，已部署私有仓库+脚本方案：
 
 - **私有配置仓库**:
-  - GitHub: https://github.com/KevinShiCN/chatgpt-configs（私有）
-  - Gitee（镜像）: https://gitee.com/kevinshicn/chatgpt-configs（私有）
+  - GitHub（主仓库）: https://github.com/KevinShiCN/chatgpt-configs（私有）
+  - Gitee（同步仓库，私有）: https://gitee.com/kevinshicn/chatgpt-configs（私有）
 - **同步工具**: `sync-config.sh`
 - **支持平台**: Linux / macOS / WSL
+
+**说明**：
+- 本服务器配置仓库只连接 Gitee
+- 其他设备同样配置双推送：GitHub + Gitee
 
 **为什么需要这个方案？**
 - `config.json` 包含 API 密钥等敏感信息
@@ -95,18 +104,26 @@ chatgpt-on-wechat-master/
 
 ### 远程仓库
 
-**代码仓库**（双推送配置）:
-- GitHub: https://github.com/KevinShiCN/chatgpt-on-wechat
-- Gitee（镜像）: https://gitee.com/kevinshicn/chatgpt-on-wechat
+**本服务器配置**（只连接 Gitee）:
+- fetch: https://gitee.com/kevinshicn/chatgpt-on-wechat
+- push: https://gitee.com/kevinshicn/chatgpt-on-wechat
 
-**配置仓库**（私有，双推送配置）:
-- GitHub: https://github.com/KevinShiCN/chatgpt-configs
-- Gitee（镜像）: https://gitee.com/kevinshicn/chatgpt-configs
+**其他设备配置**（双推送）:
+- fetch: https://github.com/KevinShiCN/chatgpt-on-wechat（从 GitHub 拉取）
+- push: https://github.com/KevinShiCN/chatgpt-on-wechat + https://gitee.com/kevinshicn/chatgpt-on-wechat（同时推送）
 
-**双推送说明**:
-- 执行 `git push` 时，自动推送到 GitHub 和 Gitee 两个平台
-- 从 GitHub 拉取（fetch）
-- Gitee 作为镜像备份，网络不稳定时可从 Gitee 拉取
+**架构说明**:
+```
+GitHub（主库）← 其他设备推送
+     ↓
+  Gitee（同步库）← 本服务器只连接这里
+```
+
+**配置仓库同理**:
+- GitHub: https://github.com/KevinShiCN/chatgpt-configs（私有）
+- Gitee: https://gitee.com/kevinshicn/chatgpt-configs（私有）
+
+📖 **其他设备配置指南**: 参见 [SETUP_OTHER_DEVICES.md](./SETUP_OTHER_DEVICES.md)
 
 ### 分支策略
 
@@ -193,17 +210,19 @@ nohup.out
 
 ### Q: GitHub 网络不稳定怎么办？
 
-**A**: 项目已配置 Gitee 镜像，可以从 Gitee 拉取代码：
-```bash
-# 从 Gitee 克隆（首次）
-git clone https://gitee.com/kevinshicn/chatgpt-on-wechat.git
+**本服务器**：
+- 已配置只连接 Gitee，不受 GitHub 网络影响
+- 直接使用 `git push` 和 `git pull`
 
-# 从 Gitee 拉取（已克隆的仓库）
-git remote add gitee https://gitee.com/kevinshicn/chatgpt-on-wechat.git
-git pull gitee master
-```
+**其他设备**（Windows/Mac）：
+- 配置双推送：同时推送到 GitHub 和 Gitee
+- 拉取时如果 GitHub 失败，可从 Gitee 拉取：
+  ```bash
+  git remote add gitee https://gitee.com/kevinshicn/chatgpt-on-wechat.git
+  git pull gitee master
+  ```
 
-**注意**: 推送时自动同步到 GitHub 和 Gitee 两个平台，无需手动操作。
+**详细配置**: 参见 [SETUP_OTHER_DEVICES.md](./SETUP_OTHER_DEVICES.md)
 
 ### Q: 配置仓库密钥在哪里？
 
@@ -228,8 +247,10 @@ CONFIG_FILES=(
 - ✅ 创建私有配置仓库（GitHub + Gitee）
 - ✅ 完成多服务器配置同步测试
 - ✅ 添加 CLAUDE.md 项目文档
-- ✅ 配置 Gitee 镜像仓库（代码 + 配置）
-- ✅ 实现双平台自动推送（GitHub + Gitee）
+- ✅ 配置 Gitee 同步仓库（代码 + 配置，全部私有）
+- ✅ 本服务器调整为只连接 Gitee（GitHub 网络不稳定）
+- ✅ 创建其他设备配置指南 SETUP_OTHER_DEVICES.md
+- ✅ 实现 GitHub（主库）+ Gitee（同步库）架构
 
 ### 2025-12-12
 - ✅ Git 仓库初始化

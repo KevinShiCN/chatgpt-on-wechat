@@ -205,8 +205,30 @@ class ChatChannel(Channel):
                 cleanup_expired_cache()
 
         logger.debug("[chat_channel] ready to handle context: {}".format(context))
-        # reply的构建步骤
-        reply = self._generate_reply(context)
+
+        # 获取重试次数配置，默认为2次
+        max_retry = conf().get("empty_reply_retry_count", 2)
+        retry_count = 0
+        reply = None
+
+        # 重试逻辑
+        while retry_count <= max_retry:
+            # reply的构建步骤
+            reply = self._generate_reply(context)
+
+            # 如果reply有内容，直接跳出循环
+            if reply and reply.content:
+                break
+
+            # 如果没有内容且还有重试次数
+            if retry_count < max_retry:
+                retry_count += 1
+                logger.warning(f"[chat_channel] reply is empty, retrying... ({retry_count}/{max_retry})")
+                time.sleep(2 * retry_count)  # 递增延迟：2秒、4秒、6秒...
+            else:
+                # 已达到最大重试次数
+                retry_count += 1
+                break
 
         logger.debug("[chat_channel] ready to decorate reply: {}".format(reply))
 
@@ -216,6 +238,12 @@ class ChatChannel(Channel):
 
             # reply的发送步骤
             self._send_reply(context, reply)
+        else:
+            # 处理空回复的情况,给用户明确的反馈
+            logger.error(f"[chat_channel] reply is empty after {retry_count} attempts, context: {context}")
+            error_reply = Reply(ReplyType.ERROR, f"抱歉,我尝试了 {retry_count} 次但仍无法生成回复,请稍后再试")
+            error_reply = self._decorate_reply(context, error_reply)
+            self._send_reply(context, error_reply)
 
     def _generate_reply(self, context: Context, reply: Reply = Reply()) -> Reply:
         e_context = PluginManager().emit_event(

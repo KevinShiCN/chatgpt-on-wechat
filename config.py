@@ -51,6 +51,7 @@ available_setting = {
     "concurrency_in_session": 1,  # 同一会话最多有多少条消息在处理中，大于1可能乱序
     "image_create_size": "256x256",  # 图片大小,可选有 256x256, 512x512, 1024x1024 (dall-e-3默认为1024x1024)
     "group_chat_exit_group": False,
+    "empty_reply_retry_count": 2,  # 当回复为空时的重试次数，默认为2次
     # chatgpt会话参数
     "expires_in_seconds": 3600,  # 无操作会话的过期时间
     # 人格描述

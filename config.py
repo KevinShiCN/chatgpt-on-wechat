@@ -47,9 +47,12 @@ available_setting = {
     "azure_openai_dalle_api_key": "", # [可选] azure openai 用于回复图片的资源 key，默认使用 open_ai_api_key
     "azure_openai_dalle_deployment_id":"", # [可选] azure openai 用于回复图片的资源 deployment id，默认使用 text_to_image
     "image_proxy": True,  # 是否需要图片代理，国内访问LinkAI时需要
-    "image_create_prefix": ["画", "看", "找"],  # 开启图片回复的前缀
+    "image_create_prefix": ["生图", "画", "看", "找"],  # 开启图片回复的前缀
     "concurrency_in_session": 1,  # 同一会话最多有多少条消息在处理中，大于1可能乱序
     "image_create_size": "256x256",  # 图片大小,可选有 256x256, 512x512, 1024x1024 (dall-e-3默认为1024x1024)
+    # Nano-banana 图像生成配置（使用 open_ai_api_base 作为服务地址）
+    "kgapi_image_model": "nano-banana-2-4k",  # 生图模型，可选 nano-banana, nano-banana-hd, nano-banana-2-4k
+    "kgapi_image_size": "4K",  # 图片尺寸，仅 nano-banana-2 支持，可选 1K, 2K, 4K
     "group_chat_exit_group": False,
     "empty_reply_retry_count": 2,  # 当回复为空时的重试次数，默认为2次
     # chatgpt会话参数

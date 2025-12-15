@@ -11,6 +11,7 @@ from bot.session_manager import SessionManager
 from bridge.context import Context, ContextType
 from bridge.reply import Reply, ReplyType
 from common.log import logger
+from common.error_notify import notify_model_error
 from config import conf, pconf
 import threading
 from common import memory, utils
@@ -155,15 +156,20 @@ class LinkAIBot(Bot):
             else:
                 response = res.json()
                 error = response.get("error")
-                logger.error(f"[LINKAI] chat failed, status_code={res.status_code}, "
-                             f"msg={error.get('message')}, type={error.get('type')}")
+                error_msg = f"status_code={res.status_code}, msg={error.get('message')}, type={error.get('type')}"
+                logger.error(f"[LINKAI] chat failed, {error_msg}")
 
                 if res.status_code >= 500:
                     # server error, need retry
                     time.sleep(2)
                     logger.warn(f"[LINKAI] do retry, times={retry_count}")
+                    if retry_count >= 2:
+                        # 重试失败后发送错误通知
+                        notify_model_error("LinkAI", error_msg)
                     return self._chat(query, context, retry_count + 1)
 
+                # 非重试错误，直接发送通知
+                notify_model_error("LinkAI", error_msg)
                 error_reply = "提问太快啦，请休息一下再问我吧"
                 if res.status_code == 409:
                     error_reply = "这个问题我还没有学会，请问我其它问题吧"
@@ -174,6 +180,9 @@ class LinkAIBot(Bot):
             # retry
             time.sleep(2)
             logger.warn(f"[LINKAI] do retry, times={retry_count}")
+            if retry_count >= 2:
+                # 重试失败后发送错误通知
+                notify_model_error("LinkAI", str(e), exception=e)
             return self._chat(query, context, retry_count + 1)
 
     def _process_image_msg(self, app_code: str, session_id: str, query:str, img_cache: dict):
@@ -279,15 +288,18 @@ class LinkAIBot(Bot):
             else:
                 response = res.json()
                 error = response.get("error")
-                logger.error(f"[LINKAI] chat failed, status_code={res.status_code}, "
-                             f"msg={error.get('message')}, type={error.get('type')}")
+                error_msg = f"status_code={res.status_code}, msg={error.get('message')}, type={error.get('type')}"
+                logger.error(f"[LINKAI] chat failed, {error_msg}")
 
                 if res.status_code >= 500:
                     # server error, need retry
                     time.sleep(2)
                     logger.warn(f"[LINKAI] do retry, times={retry_count}")
+                    if retry_count >= 2:
+                        notify_model_error("LinkAI", error_msg)
                     return self.reply_text(session, app_code, retry_count + 1)
 
+                notify_model_error("LinkAI", error_msg)
                 return {
                     "total_tokens": 0,
                     "completion_tokens": 0,
@@ -299,6 +311,8 @@ class LinkAIBot(Bot):
             # retry
             time.sleep(2)
             logger.warn(f"[LINKAI] do retry, times={retry_count}")
+            if retry_count >= 2:
+                notify_model_error("LinkAI", str(e), exception=e)
             return self.reply_text(session, app_code, retry_count + 1)
 
     def _fetch_app_info(self, app_code: str):

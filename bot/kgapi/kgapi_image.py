@@ -8,12 +8,19 @@ KGAPI 图像生成模块
 import requests
 import time
 import os
+import re
 import socket
 from common.log import logger
 from config import conf
 
 # 设置socket默认超时时间（解决写入超时问题）
 socket.setdefaulttimeout(180)
+
+# 支持的 aspect_ratio 值
+SUPPORTED_ASPECT_RATIOS = {
+    "1:1", "4:3", "3:4", "16:9", "9:16",
+    "2:3", "3:2", "4:5", "5:4", "21:9"
+}
 
 
 class KGAPIImage:
@@ -23,9 +30,32 @@ class KGAPIImage:
         self.api_base = api_base.rstrip("/")
         if not self.api_base.endswith("/v1"):
             self.api_base = self.api_base + "/v1"
-        
+
         self.model = conf().get("kgapi_image_model", "nano-banana-2-4k")
         self.image_size = conf().get("kgapi_image_size", "4K")
+
+    @staticmethod
+    def parse_aspect_ratio(query):
+        """
+        从提示词中解析 aspect_ratio
+        支持格式: 16:9, 16：9 (中英文冒号兼容)
+        返回: (aspect_ratio, cleaned_query)
+        """
+        # 匹配比例格式，支持中英文冒号
+        pattern = r'\b(\d{1,2})\s*[：:]\s*(\d{1,2})\b'
+        match = re.search(pattern, query)
+
+        if match:
+            w, h = match.groups()
+            ratio = f"{w}:{h}"
+            if ratio in SUPPORTED_ASPECT_RATIOS:
+                # 从 query 中移除比例信息
+                cleaned_query = re.sub(pattern, '', query, count=1).strip()
+                cleaned_query = re.sub(r'\s+', ' ', cleaned_query)  # 清理多余空格
+                logger.info(f"[KGAPI] parsed aspect_ratio: {ratio}")
+                return ratio, cleaned_query
+
+        return None, query
 
     def create_img(self, query, retry_count=0, api_key=None):
         """文生图"""
@@ -33,8 +63,10 @@ class KGAPIImage:
             if not self.api_key and not api_key:
                 return False, "API Key未配置"
 
-            logger.info(f"[KGAPI] create_img query={query}")
-            
+            # 解析 aspect_ratio
+            aspect_ratio, cleaned_query = self.parse_aspect_ratio(query)
+            logger.info(f"[KGAPI] create_img query={cleaned_query}, aspect_ratio={aspect_ratio}")
+
             url = f"{self.api_base}/images/generations"
             headers = {
                 "Content-Type": "application/json",
@@ -42,16 +74,18 @@ class KGAPIImage:
             }
             data = {
                 "model": self.model,
-                "prompt": query,
+                "prompt": cleaned_query,
                 "response_format": "url"
             }
-            
+
             if "nano-banana-2" in self.model:
                 data["image_size"] = self.image_size
-            
+                if aspect_ratio:
+                    data["aspect_ratio"] = aspect_ratio
+
             res = requests.post(url, headers=headers, json=data, timeout=(5, 120))
             res.raise_for_status()
-            
+
             result = res.json()
             image_url = result["data"][0]["url"]
             logger.info(f"[KGAPI] create_img success, url={image_url}")
@@ -75,7 +109,9 @@ class KGAPIImage:
             if not image_paths:
                 return False, "未提供参考图片"
 
-            logger.info(f"[KGAPI] edit_img start: query={query}, images={len(image_paths)}, retry={retry_count}")
+            # 解析 aspect_ratio
+            aspect_ratio, cleaned_query = self.parse_aspect_ratio(query)
+            logger.info(f"[KGAPI] edit_img start: query={cleaned_query}, aspect_ratio={aspect_ratio}, images={len(image_paths)}, retry={retry_count}")
 
             url = f"{self.api_base}/images/edits"
             headers = {
@@ -103,14 +139,16 @@ class KGAPIImage:
 
             data = {
                 "model": self.model,
-                "prompt": query,
+                "prompt": cleaned_query,
                 "response_format": "url"
             }
 
             if "nano-banana-2" in self.model:
                 data["image_size"] = self.image_size
+                if aspect_ratio:
+                    data["aspect_ratio"] = aspect_ratio
 
-            logger.info(f"[KGAPI] sending request to {url}, model={self.model}, image_size={self.image_size}")
+            logger.info(f"[KGAPI] sending request to {url}, model={self.model}, image_size={self.image_size}, aspect_ratio={aspect_ratio}")
             start_time = time.time()
 
             # 增加超时时间：连接30秒，读取180秒（上传图片需要更长时间）

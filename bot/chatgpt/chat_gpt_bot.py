@@ -17,6 +17,7 @@ from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
 from common.log import logger
 from common.token_bucket import TokenBucket
+from common.error_notify import notify_model_error
 from config import conf, load_config
 from bot.baidu.baidu_wenxin_session import BaiduWenxinSession
 
@@ -229,6 +230,8 @@ class ChatGPTBot(Bot, KGAPIImage):
                 logger.warn("[CHATGPT] 第{}次重试".format(retry_count + 1))
                 return self.reply_text(session, api_key, args, retry_count + 1)
             else:
+                # 重试失败后发送错误通知
+                notify_model_error("ChatGPT", str(e), exception=e)
                 return result
 
     def reply_image(self, img_path, query_text, session_id, context, api_key=None, retry_count=0) -> dict:

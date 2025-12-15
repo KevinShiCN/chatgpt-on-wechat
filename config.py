@@ -48,6 +48,10 @@ available_setting = {
     "azure_openai_dalle_deployment_id":"", # [可选] azure openai 用于回复图片的资源 deployment id，默认使用 text_to_image
     "image_proxy": True,  # 是否需要图片代理，国内访问LinkAI时需要
     "image_create_prefix": ["生图", "画", "看", "找"],  # 开启图片回复的前缀
+    # 抽卡功能配置（批量生图）
+    "gacha_prefix": ["抽卡"],  # 抽卡触发前缀
+    "gacha_max_count": 20,  # 单次最大抽卡数量
+    "gacha_default_count": 3,  # 默认抽卡数量（未指定时）
     "concurrency_in_session": 1,  # 同一会话最多有多少条消息在处理中，大于1可能乱序
     "image_create_size": "256x256",  # 图片大小,可选有 256x256, 512x512, 1024x1024 (dall-e-3默认为1024x1024)
     # Nano-banana 图像生成配置（使用 open_ai_api_base 作为服务地址）
@@ -188,6 +192,11 @@ available_setting = {
     "Minimax_group_id": "",
     "Minimax_base_url": "",
     "web_port": 9899,
+    # 错误通知配置（企业微信webhook）
+    "error_notify_enabled": False,  # 是否启用错误通知
+    "error_notify_webhook": "",  # 企业微信webhook地址
+    "error_notify_mentioned_mobiles": [],  # 需要@的手机号列表
+    "error_notify_rate_limit": 60,  # 同类错误的最小通知间隔（秒）
 }
 
 

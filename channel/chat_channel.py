@@ -10,6 +10,7 @@ from bridge.reply import *
 from channel.channel import Channel
 from common.dequeue import Dequeue
 from common import memory
+from common.error_notify import notify_channel_error
 from plugins import *
 
 try:
@@ -56,6 +57,44 @@ class ChatChannel(Channel):
         _thread = threading.Thread(target=self.consume)
         _thread.setDaemon(True)
         _thread.start()
+
+    def _parse_gacha_command(self, content):
+        """
+        解析抽卡命令
+        格式: [次数] [比例(可选)] [提示词]
+
+        示例:
+        - "10 16:9 一只猫" → (10, "16:9 一只猫")
+        - "3 美丽风景"     → (3, "美丽风景")
+        - "风景"          → (默认次数, "风景")
+
+        返回: (count, prompt_with_ratio)
+        """
+        content = content.strip()
+        if not content:
+            return conf().get("gacha_default_count", 3), ""
+
+        # 匹配开头的数字（抽卡次数）
+        match = re.match(r'^(\d+)\s*(.*)$', content)
+
+        if match:
+            count = int(match.group(1))
+            prompt_with_ratio = match.group(2).strip()
+        else:
+            count = conf().get("gacha_default_count", 3)
+            prompt_with_ratio = content
+
+        # 限制最大次数
+        max_count = conf().get("gacha_max_count", 20)
+        if count > max_count:
+            logger.warning(f"[chat_channel] gacha count {count} exceeds max {max_count}, limiting to {max_count}")
+            count = max_count
+
+        # 确保至少1次
+        if count < 1:
+            count = 1
+
+        return count, prompt_with_ratio
 
     # 根据消息构造context，消息内容相关的触发项写在这里
     def _compose_context(self, ctype: ContextType, content, **kwargs):
@@ -173,13 +212,23 @@ class ChatChannel(Channel):
                     logger.info("[chat_channel]receive single chat msg, but checkprefix didn't match")
                     return None
             content = content.strip()
-            img_match_prefix = check_prefix(content, conf().get("image_create_prefix",[""]))
-            if img_match_prefix:
-                content = content.replace(img_match_prefix, "", 1)
-                context.type = ContextType.IMAGE_CREATE
+            # 抽卡前缀匹配（优先于普通生图）
+            gacha_match_prefix = check_prefix(content, conf().get("gacha_prefix") or ["抽卡"])
+            if gacha_match_prefix:
+                content = content.replace(gacha_match_prefix, "", 1).strip()
+                # 解析抽卡次数和提示词
+                gacha_count, gacha_prompt = self._parse_gacha_command(content)
+                context.type = ContextType.GACHA_CREATE
+                context["gacha_count"] = gacha_count
+                context.content = gacha_prompt
             else:
-                context.type = ContextType.TEXT
-            context.content = content.strip()
+                img_match_prefix = check_prefix(content, conf().get("image_create_prefix",[""]))
+                if img_match_prefix:
+                    content = content.replace(img_match_prefix, "", 1)
+                    context.type = ContextType.IMAGE_CREATE
+                else:
+                    context.type = ContextType.TEXT
+                context.content = content.strip()
             if "desire_rtype" not in context and conf().get("always_reply_voice") and ReplyType.VOICE not in self.NOT_SUPPORT_REPLYTYPE:
                 context["desire_rtype"] = ReplyType.VOICE
         elif context.type == ContextType.VOICE:
@@ -190,8 +239,8 @@ class ChatChannel(Channel):
     def _handle(self, context: Context):
         if context is None:
             return
-        # IMAGE_CREATE类型允许空content（用户可能只发送"生图"前缀，等待后续图片）
-        if not context.content and context.type != ContextType.IMAGE_CREATE:
+        # IMAGE_CREATE和GACHA_CREATE类型允许空content（用户可能只发送前缀，等待后续图片）
+        if not context.content and context.type not in [ContextType.IMAGE_CREATE, ContextType.GACHA_CREATE]:
             return
 
         # 消息去重检查
@@ -228,8 +277,8 @@ class ChatChannel(Channel):
             if reply and reply.content:
                 break
 
-            # IMAGE_CREATE类型使用异步处理，空reply是正常的，不需要重试
-            if context.type == ContextType.IMAGE_CREATE:
+            # IMAGE_CREATE和GACHA_CREATE类型使用异步处理，空reply是正常的，不需要重试
+            if context.type in [ContextType.IMAGE_CREATE, ContextType.GACHA_CREATE]:
                 break
 
             # 如果TEXT消息更新了pending_image_create，空reply是正常的，不需要重试
@@ -272,9 +321,9 @@ class ChatChannel(Channel):
             # reply的发送步骤
             self._send_reply(context, reply)
         else:
-            # IMAGE_CREATE类型使用异步处理，空reply是正常的，不发送错误消息
-            if context.type == ContextType.IMAGE_CREATE:
-                logger.info("[chat_channel] IMAGE_CREATE async processing, no immediate reply")
+            # IMAGE_CREATE和GACHA_CREATE类型使用异步处理，空reply是正常的，不发送错误消息
+            if context.type in [ContextType.IMAGE_CREATE, ContextType.GACHA_CREATE]:
+                logger.info(f"[chat_channel] {context.type} async processing, no immediate reply")
             # IMAGE类型如果被添加到pending_image_create，也不发送错误消息
             elif context.type == ContextType.IMAGE and context.get("session_id") in pending_image_create:
                 logger.info("[chat_channel] IMAGE added to IMAGE_CREATE, no error reply needed")
@@ -592,6 +641,159 @@ class ChatChannel(Channel):
 
                         # 不返回 reply，由异步任务处理
                         return Reply()
+            elif context.type == ContextType.GACHA_CREATE:  # 抽卡生图（批量生成）
+                session_id = context.get("session_id")
+                gacha_count = context.get("gacha_count", conf().get("gacha_default_count", 3))
+
+                # 检查是否配置了 nano-banana 生图模型
+                kgapi_model = conf().get("kgapi_image_model", "")
+                if not kgapi_model or not kgapi_model.startswith("nano-banana"):
+                    # 未配置 nano-banana 模型，提示用户
+                    logger.warning("[chat_channel] GACHA_CREATE requires nano-banana model")
+                    return Reply(ReplyType.ERROR, "抽卡功能需要配置 nano-banana 生图模型")
+
+                logger.info(f"[chat_channel] GACHA_CREATE received, count={gacha_count}, start processing...")
+
+                def gacha_image_create_handler():
+                    from bot.kgapi.kgapi_image import KGAPIImage
+                    kgapi = KGAPIImage()
+
+                    # 动态等待参考图片（复用现有机制）
+                    logger.info(f"[chat_channel] GACHA waiting for user input (initial {TEXT_WAIT_TIME}s)...")
+                    time.sleep(TEXT_WAIT_TIME)
+
+                    # 动态等待循环
+                    max_total_wait = 180
+                    total_waited = TEXT_WAIT_TIME
+                    while total_waited < max_total_wait:
+                        if session_id not in pending_image_create:
+                            logger.info("[chat_channel] GACHA task was cancelled or removed")
+                            return
+
+                        pending = pending_image_create[session_id]
+                        last_image_time = pending.get("last_image_time", pending["time"])
+                        time_since_last_image = time.time() - last_image_time
+
+                        if time_since_last_image >= IMAGE_WAIT_TIME:
+                            logger.info(f"[chat_channel] GACHA {IMAGE_WAIT_TIME}s passed since last image, starting...")
+                            break
+
+                        time.sleep(2)
+                        total_waited += 2
+
+                    if session_id not in pending_image_create:
+                        logger.info("[chat_channel] GACHA task was cancelled or removed")
+                        return
+
+                    pending = pending_image_create[session_id]
+                    ref_images = pending.get("ref_images", [])
+                    final_content = pending["context"].content
+                    gacha_count_final = pending["context"].get("gacha_count", gacha_count)
+
+                    # 检查是否有内容
+                    if not final_content and not ref_images:
+                        logger.info("[chat_channel] GACHA timeout with no content or images, skipping")
+                        del pending_image_create[session_id]
+                        return
+
+                    # 发送开始提示
+                    mode_text = "图生图" if ref_images else "文生图"
+                    start_msg = f"开始抽卡，共{gacha_count_final}张（{mode_text}模式），请耐心等待...\n提示词：{final_content}"
+                    if ref_images:
+                        start_msg += f"\n参考图片：{len(ref_images)}张"
+                    start_reply = Reply(ReplyType.TEXT, start_msg)
+                    start_reply = self._decorate_reply(context, start_reply)
+                    self._send_reply(context, start_reply)
+
+                    success_count = 0
+                    fail_count = 0
+
+                    # 循环生成图片
+                    for i in range(gacha_count_final):
+                        logger.info(f"[chat_channel] GACHA generating image {i+1}/{gacha_count_final}...")
+
+                        try:
+                            if ref_images:
+                                # 图生图模式
+                                ok, result = kgapi.edit_img(final_content, ref_images)
+                            else:
+                                # 文生图模式
+                                ok, result = kgapi.create_img(final_content)
+
+                            if ok:
+                                # 发送图片
+                                img_reply = Reply(ReplyType.IMAGE_URL, result)
+                                img_reply = self._decorate_reply(context, img_reply)
+                                self._send_reply(context, img_reply)
+
+                                # 发送进度提示
+                                progress_msg = f"第{i+1}/{gacha_count_final}张生成完成"
+                                progress_reply = Reply(ReplyType.TEXT, progress_msg)
+                                progress_reply = self._decorate_reply(context, progress_reply)
+                                self._send_reply(context, progress_reply)
+
+                                success_count += 1
+                                logger.info(f"[chat_channel] GACHA image {i+1}/{gacha_count_final} success")
+                            else:
+                                # 生成失败
+                                fail_msg = f"第{i+1}/{gacha_count_final}张生成失败: {result}"
+                                fail_reply = Reply(ReplyType.TEXT, fail_msg)
+                                fail_reply = self._decorate_reply(context, fail_reply)
+                                self._send_reply(context, fail_reply)
+
+                                fail_count += 1
+                                logger.warning(f"[chat_channel] GACHA image {i+1}/{gacha_count_final} failed: {result}")
+                        except Exception as e:
+                            fail_msg = f"第{i+1}/{gacha_count_final}张生成异常: {str(e)}"
+                            fail_reply = Reply(ReplyType.TEXT, fail_msg)
+                            fail_reply = self._decorate_reply(context, fail_reply)
+                            self._send_reply(context, fail_reply)
+
+                            fail_count += 1
+                            logger.error(f"[chat_channel] GACHA image {i+1}/{gacha_count_final} exception: {e}")
+
+                    # 清理待处理队列
+                    if session_id in pending_image_create:
+                        del pending_image_create[session_id]
+
+                    # 发送完成提示
+                    if fail_count == 0:
+                        end_msg = f"抽卡完成！共生成{success_count}张图片"
+                    else:
+                        end_msg = f"抽卡完成！成功{success_count}张，失败{fail_count}张"
+                    end_reply = Reply(ReplyType.TEXT, end_msg)
+                    end_reply = self._decorate_reply(context, end_reply)
+                    self._send_reply(context, end_reply)
+
+                    logger.info(f"[chat_channel] GACHA completed: success={success_count}, fail={fail_count}")
+
+                # 检查是否有最近的图片
+                recent_images = []
+                if session_id in memory.USER_IMAGE_CACHE:
+                    cached = memory.USER_IMAGE_CACHE[session_id]
+                    if time.time() - cached.get("time", 0) < TEXT_WAIT_TIME:
+                        img_path = cached.get("path")
+                        if img_path:
+                            recent_images.append(img_path)
+                            logger.info(f"[chat_channel] GACHA found recent image from cache: {img_path}")
+
+                # 保存待处理的抽卡消息（复用 pending_image_create）
+                pending_image_create[session_id] = {
+                    "context": context,
+                    "time": time.time(),
+                    "result": None,
+                    "cancelled": False,
+                    "ref_images": recent_images
+                }
+
+                context["channel"] = e_context["channel"]
+
+                # 提交异步处理任务
+                future = handler_pool.submit(gacha_image_create_handler)
+                pending_image_create[session_id]["future"] = future
+
+                # 不返回 reply，由异步任务处理
+                return Reply()
             elif context.type == ContextType.VOICE:  # 语音消息
                 cmsg = context["msg"]
                 cmsg.prepare()
@@ -811,12 +1013,17 @@ class ChatChannel(Channel):
             if retry_cnt < 2:
                 time.sleep(3 + 3 * retry_cnt)
                 self._send(reply, context, retry_cnt + 1)
+            else:
+                # 重试失败后发送错误通知
+                notify_channel_error("ChatChannel", f"消息发送失败: {str(e)}", exception=e)
 
     def _success_callback(self, session_id, **kwargs):  # 线程正常结束时的回调函数
         logger.debug("Worker return success, session_id = {}".format(session_id))
 
     def _fail_callback(self, session_id, exception, **kwargs):  # 线程异常结束时的回调函数
         logger.exception("Worker return exception: {}".format(exception))
+        # 发送错误通知
+        notify_channel_error("ChatChannel", f"消息处理线程异常: {str(exception)}", exception=exception)
 
     def _thread_pool_callback(self, session_id, **kwargs):
         def func(worker: Future):

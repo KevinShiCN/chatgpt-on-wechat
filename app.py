@@ -7,6 +7,7 @@ import time
 
 from channel import channel_factory
 from common import const
+from common.error_notify import init_error_notify
 from config import load_config
 from plugins import *
 import threading
@@ -44,6 +45,15 @@ def run():
     try:
         # load config
         load_config()
+
+        # 初始化错误通知
+        if conf().get("error_notify_enabled", False):
+            init_error_notify(
+                webhook_url=conf().get("error_notify_webhook", ""),
+                mentioned_mobiles=conf().get("error_notify_mentioned_mobiles", []),
+                rate_limit=conf().get("error_notify_rate_limit", 60)
+            )
+
         # ctrl + c
         sigterm_handler_wrap(signal.SIGINT)
         # kill signal

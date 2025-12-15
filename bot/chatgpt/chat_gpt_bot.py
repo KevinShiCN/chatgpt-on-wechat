@@ -11,6 +11,7 @@ from common import const
 from bot.bot import Bot
 from bot.chatgpt.chat_gpt_session import ChatGPTSession
 from bot.openai.open_ai_image import OpenAIImage
+from bot.kgapi.kgapi_image import KGAPIImage
 from bot.session_manager import SessionManager
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
@@ -20,7 +21,7 @@ from config import conf, load_config
 from bot.baidu.baidu_wenxin_session import BaiduWenxinSession
 
 # OpenAI对话模型API (可用)
-class ChatGPTBot(Bot, OpenAIImage):
+class ChatGPTBot(Bot, KGAPIImage):
     def __init__(self):
         super().__init__()
         # set the default api_key

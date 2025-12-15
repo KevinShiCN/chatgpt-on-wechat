@@ -187,7 +187,10 @@ class ChatChannel(Channel):
         return context
 
     def _handle(self, context: Context):
-        if context is None or not context.content:
+        if context is None:
+            return
+        # IMAGE_CREATE类型允许空content（用户可能只发送"生图"前缀，等待后续图片）
+        if not context.content and context.type != ContextType.IMAGE_CREATE:
             return
 
         # 消息去重检查
@@ -224,6 +227,21 @@ class ChatChannel(Channel):
             if reply and reply.content:
                 break
 
+            # IMAGE_CREATE类型使用异步处理，空reply是正常的，不需要重试
+            if context.type == ContextType.IMAGE_CREATE:
+                break
+
+            # 如果TEXT消息更新了pending_image_create，空reply是正常的，不需要重试
+            session_id = context.get("session_id")
+            if context.type == ContextType.TEXT and session_id and session_id in pending_image_create:
+                logger.info("[chat_channel] TEXT message updated IMAGE_CREATE prompt, no retry needed")
+                break
+
+            # 如果IMAGE消息添加了ref_images到pending_image_create，空reply是正常的，不需要重试
+            if context.type == ContextType.IMAGE and session_id and session_id in pending_image_create:
+                logger.info("[chat_channel] IMAGE added to IMAGE_CREATE task, no retry needed")
+                break
+
             # 如果没有内容且还有重试次数
             if retry_count < max_retry:
                 retry_count += 1
@@ -243,11 +261,21 @@ class ChatChannel(Channel):
             # reply的发送步骤
             self._send_reply(context, reply)
         else:
-            # 处理空回复的情况,给用户明确的反馈
-            logger.error(f"[chat_channel] reply is empty after {retry_count} attempts, context: {context}")
-            error_reply = Reply(ReplyType.ERROR, f"抱歉,我尝试了 {retry_count} 次但仍无法生成回复,请稍后再试")
-            error_reply = self._decorate_reply(context, error_reply)
-            self._send_reply(context, error_reply)
+            # IMAGE_CREATE类型使用异步处理，空reply是正常的，不发送错误消息
+            if context.type == ContextType.IMAGE_CREATE:
+                logger.info("[chat_channel] IMAGE_CREATE async processing, no immediate reply")
+            # IMAGE类型如果被添加到pending_image_create，也不发送错误消息
+            elif context.type == ContextType.IMAGE and context.get("session_id") in pending_image_create:
+                logger.info("[chat_channel] IMAGE added to IMAGE_CREATE, no error reply needed")
+            # TEXT类型如果更新了pending_image_create，也不发送错误消息
+            elif context.type == ContextType.TEXT and context.get("session_id") in pending_image_create:
+                logger.info("[chat_channel] TEXT updated IMAGE_CREATE prompt, no error reply needed")
+            else:
+                # 处理空回复的情况,给用户明确的反馈
+                logger.error(f"[chat_channel] reply is empty after {retry_count} attempts, context: {context}")
+                error_reply = Reply(ReplyType.ERROR, f"抱歉,我尝试了 {retry_count} 次但仍无法生成回复,请稍后再试")
+                error_reply = self._decorate_reply(context, error_reply)
+                self._send_reply(context, error_reply)
 
     def _generate_reply(self, context: Context, reply: Reply = Reply()) -> Reply:
         e_context = PluginManager().emit_event(
@@ -263,6 +291,17 @@ class ChatChannel(Channel):
                 if context.type == ContextType.TEXT:
                     # 文本消息延迟处理，等待可能的图片
                     session_id = context.get("session_id")
+
+                    # 检查是否有待处理的IMAGE_CREATE（用户发送了"生图"后又发送文本描述）
+                    if session_id and session_id in pending_image_create:
+                        # 更新IMAGE_CREATE的prompt内容
+                        pending = pending_image_create[session_id]
+                        old_content = pending["context"].content
+                        new_content = context.content if not old_content else f"{old_content} {context.content}"
+                        pending["context"].content = new_content
+                        logger.info(f"[chat_channel] updated IMAGE_CREATE prompt: {new_content[:50]}...")
+                        # 不继续处理这条文本消息，等待图片
+                        return Reply()
 
                     # 检查是否有待处理的图片消息正在等待文本
                     if session_id and session_id in pending_text_messages:
@@ -335,59 +374,119 @@ class ChatChannel(Channel):
                         
                         def immediate_image_create_handler():
                             from bot.kgapi.kgapi_image import KGAPIImage
+                            from concurrent.futures import ThreadPoolExecutor, as_completed
                             kgapi = KGAPIImage()
-                            
-                            # 立即开始文生图
-                            logger.info("[chat_channel] starting image generation...")
-                            ok, result = kgapi.create_img(context.content)
-                            
-                            # 保存处理结果
-                            if session_id in pending_image_create:
-                                pending_image_create[session_id]["result"] = (ok, result)
-                            
-                            # 等待指定时间，看是否有参考图片到来
+
+                            # 等待10秒，接收用户的图片和描述
+                            logger.info(f"[chat_channel] waiting {TEXT_WAIT_TIME}s to receive user input (images/descriptions)...")
                             time.sleep(TEXT_WAIT_TIME)
-                            
-                            # 检查是否被取消（收到了参考图片）
-                            if session_id in pending_image_create and not pending_image_create[session_id].get("cancelled", False):
-                                # 没有被取消，发送文生图结果
-                                logger.info("[chat_channel] no reference image received, sending generated image")
-                                ref_images = pending_image_create[session_id].get("ref_images", [])
-                                del pending_image_create[session_id]
-                                
-                                if ref_images:
-                                    # 有参考图片，改用图生图
-                                    logger.info(f"[chat_channel] found {len(ref_images)} reference images, switching to edit mode")
-                                    ok, result = kgapi.edit_img(context.content, ref_images)
-                                
-                                if ok:
-                                    img_reply = Reply(ReplyType.IMAGE_URL, result)
+
+                            # 10秒后，检查pending_image_create的状态
+                            if session_id not in pending_image_create:
+                                logger.info("[chat_channel] IMAGE_CREATE task was cancelled or removed")
+                                return
+
+                            pending = pending_image_create[session_id]
+                            ref_images = pending.get("ref_images", [])
+                            final_content = pending["context"].content
+
+                            # 根据收到的内容决定使用哪种API
+                            ok, result = None, None
+
+                            # 定期提醒功能
+                            reminder_stop = threading.Event()
+                            def send_reminder():
+                                """每60秒发送一次进度提醒"""
+                                minute = 1
+                                while not reminder_stop.is_set():
+                                    if reminder_stop.wait(60):  # 等待60秒或被停止
+                                        break
+                                    if not reminder_stop.is_set():
+                                        reminder_msg = f"正在生图中，已等待{minute}分钟，请继续耐心等待..."
+                                        reminder_reply = Reply(ReplyType.TEXT, reminder_msg)
+                                        reminder_reply = self._decorate_reply(context, reminder_reply)
+                                        self._send_reply(context, reminder_reply)
+                                        logger.info(f"[chat_channel] sent reminder: {minute} minute(s) elapsed")
+                                        minute += 1
+
+                            # 如果有参考图片，使用图生图
+                            if ref_images:
+                                logger.info(f"[chat_channel] found {len(ref_images)} reference images, using edit mode")
+                                if final_content and final_content.strip():
+                                    # 发送提示消息
+                                    tip_msg = f"收到了{len(ref_images)}张图片，以及提示词：{final_content}\n正在为您生图，请等待1-2分钟，如有问题请联系管理员干饭CEO"
+                                    tip_reply = Reply(ReplyType.TEXT, tip_msg)
+                                    tip_reply = self._decorate_reply(context, tip_reply)
+                                    self._send_reply(context, tip_reply)
+                                    # 启动提醒线程
+                                    reminder_thread = threading.Thread(target=send_reminder, daemon=True)
+                                    reminder_thread.start()
+                                    # 调用图生图API
+                                    ok, result = kgapi.edit_img(final_content, ref_images)
+                                    # 停止提醒线程
+                                    reminder_stop.set()
                                 else:
-                                    img_reply = Reply(ReplyType.ERROR, result)
-                                
-                                img_reply = self._decorate_reply(context, img_reply)
-                                self._send_reply(context, img_reply)
+                                    logger.warning("[chat_channel] IMAGE_CREATE with reference images but no description")
+                                    ok, result = False, "请提供图片描述"
+                            # 如果没有参考图片但有描述，使用文生图
+                            elif final_content and final_content.strip():
+                                logger.info("[chat_channel] no reference image received, using text-to-image")
+                                # 发送提示消息
+                                tip_msg = f"收到了提示词：{final_content}\n正在为您生图，请等待1-2分钟，如有问题请联系管理员干饭CEO"
+                                tip_reply = Reply(ReplyType.TEXT, tip_msg)
+                                tip_reply = self._decorate_reply(context, tip_reply)
+                                self._send_reply(context, tip_reply)
+                                # 启动提醒线程
+                                reminder_thread = threading.Thread(target=send_reminder, daemon=True)
+                                reminder_thread.start()
+                                # 调用文生图API
+                                ok, result = kgapi.create_img(final_content)
+                                # 停止提醒线程
+                                reminder_stop.set()
                             else:
-                                # 被取消了，由图片处理逻辑负责
-                                logger.info("[chat_channel] image create was merged with reference images")
-                                if session_id in pending_image_create:
-                                    del pending_image_create[session_id]
+                                # 既没有图片也没有描述，不发送任何消息
+                                logger.info("[chat_channel] IMAGE_CREATE timeout with no content or images, skipping")
+                                del pending_image_create[session_id]
+                                return
+
+                            # 清理待处理队列
+                            del pending_image_create[session_id]
+
+                            # 发送结果
+                            if ok:
+                                img_reply = Reply(ReplyType.IMAGE_URL, result)
+                            else:
+                                img_reply = Reply(ReplyType.ERROR, result)
+
+                            img_reply = self._decorate_reply(context, img_reply)
+                            self._send_reply(context, img_reply)
                         
+                        # 检查是否有最近的图片（用户可能先发图片后发"生图"文本）
+                        recent_images = []
+                        if session_id in memory.USER_IMAGE_CACHE:
+                            cached = memory.USER_IMAGE_CACHE[session_id]
+                            # 检查图片是否在10秒内
+                            if time.time() - cached.get("time", 0) < TEXT_WAIT_TIME:
+                                img_path = cached.get("path")
+                                if img_path:
+                                    recent_images.append(img_path)
+                                    logger.info(f"[chat_channel] found recent image from cache: {img_path}")
+
                         # 保存待处理的生图消息
                         pending_image_create[session_id] = {
                             "context": context,
                             "time": time.time(),
                             "result": None,
                             "cancelled": False,
-                            "ref_images": []
+                            "ref_images": recent_images  # 包含最近的图片
                         }
-                        
+
                         context["channel"] = e_context["channel"]
-                        
+
                         # 提交异步处理任务
                         future = handler_pool.submit(immediate_image_create_handler)
                         pending_image_create[session_id]["future"] = future
-                        
+
                         # 不返回 reply，由异步任务处理
                         return Reply()
             elif context.type == ContextType.VOICE:  # 语音消息
@@ -442,46 +541,54 @@ class ChatChannel(Channel):
                     # 有待处理的生图请求，将此图片作为参考图片
                     pending = pending_image_create[session_id]
                     img_create_context = pending["context"]
-                    
+
                     logger.info(f"[chat_channel] found pending image create, adding reference image for: {img_create_context.content[:50]}...")
-                    
+
                     # 确保图片已下载
                     cmsg = context["msg"]
                     cmsg.prepare()
-                    
+
                     # 添加参考图片路径
                     pending["ref_images"].append(context.content)
-                    
-                    # 标记为已取消，由图生图处理
-                    pending["cancelled"] = True
-                    
-                    # 使用KGAPI进行图生图
-                    from bot.kgapi.kgapi_image import KGAPIImage
-                    kgapi = KGAPIImage()
-                    
-                    ok, result = kgapi.edit_img(img_create_context.content, pending["ref_images"])
-                    
-                    # 清理待处理队列
-                    del pending_image_create[session_id]
-                    
-                    if ok:
-                        reply = Reply(ReplyType.IMAGE_URL, result)
-                    else:
-                        reply = Reply(ReplyType.ERROR, result)
-                    
-                    return reply
 
-                # 保存图片到缓存（用于某些插件）
+                    # 不要立即调用图生图API，让异步任务在10秒后统一处理
+                    # 这样图生图也可以在后台运行，不会阻塞
+                    logger.info("[chat_channel] reference image added, will be processed by async task")
+
+                    # 不在这里发送提示消息，等10秒窗口结束后统一发送
+                    # 这样可以准确显示收到的图片数量
+                    return Reply()
+
+                # 保存图片到缓存（用于某些插件，以及"先图片后生图文本"的场景）
+                cmsg = context["msg"]
+                cmsg.prepare()  # 确保图片已下载
+
                 memory.USER_IMAGE_CACHE[session_id] = {
                     "path": context.content,
-                    "msg": context.get("msg"),
+                    "msg": cmsg,
                     "time": time.time()
                 }
 
-                # 调用 bot 进行图片识别
-                logger.info("[chat_channel] processing image message: {}".format(context.content))
-                cmsg = context["msg"]
-                cmsg.prepare()  # 确保图片已下载
+                # 等待3秒，看是否有"生图"文本到来
+                # 如果有，这张图片会被添加到pending_image_create，不需要进行图片识别
+                logger.info("[chat_channel] image received, waiting 3s to check if IMAGE_CREATE will come...")
+                time.sleep(3)
+
+                # 检查是否已经有pending_image_create（用户发送了"生图"文本）
+                if session_id in pending_image_create:
+                    # 检查这张图片是否已经被添加到ref_images
+                    pending = pending_image_create[session_id]
+                    if context.content in pending.get("ref_images", []):
+                        logger.info("[chat_channel] image already added to IMAGE_CREATE, skip image recognition")
+                        return Reply()
+                    else:
+                        # 图片还没被添加，手动添加
+                        pending["ref_images"].append(context.content)
+                        logger.info("[chat_channel] image added to IMAGE_CREATE after waiting, skip image recognition")
+                        return Reply()
+
+                # 没有pending_image_create，进行正常的图片识别
+                logger.info("[chat_channel] no IMAGE_CREATE found, processing image message: {}".format(context.content))
 
                 # 如果有文本，将其传递给 bot
                 if text_query:

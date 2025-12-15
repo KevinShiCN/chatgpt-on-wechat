@@ -27,6 +27,7 @@ MESSAGE_EXPIRY = 300  # 消息ID缓存过期时间（秒）
 # 待处理的文本消息（等待可能的图片）
 pending_text_messages = {}  # {session_id: {"context": context, "time": timestamp, "future": future, "reply": reply, "cancelled": False}}
 TEXT_WAIT_TIME = 10  # 等待图片的时间（秒）
+IMAGE_WAIT_TIME = 20  # 每张图片之间的等待时间（秒），收到新图片会重置倒计时
 
 # 待处理的生图消息（等待可能的参考图片）
 pending_image_create = {}  # {session_id: {"context": context, "time": timestamp, "future": future, "result": result, "cancelled": False, "ref_images": []}}
@@ -237,9 +238,19 @@ class ChatChannel(Channel):
                 logger.info("[chat_channel] TEXT message updated IMAGE_CREATE prompt, no retry needed")
                 break
 
+            # 如果TEXT消息已经提交到pending_text_messages进行异步处理，不需要重试
+            if context.type == ContextType.TEXT and session_id and session_id in pending_text_messages:
+                logger.info("[chat_channel] TEXT message submitted for async processing, no retry needed")
+                break
+
             # 如果IMAGE消息添加了ref_images到pending_image_create，空reply是正常的，不需要重试
             if context.type == ContextType.IMAGE and session_id and session_id in pending_image_create:
                 logger.info("[chat_channel] IMAGE added to IMAGE_CREATE task, no retry needed")
+                break
+
+            # 如果IMAGE消息添加到了pending_text_messages，空reply是正常的，不需要重试
+            if context.type == ContextType.IMAGE and session_id and session_id in pending_text_messages:
+                logger.info("[chat_channel] IMAGE added to TEXT task, no retry needed")
                 break
 
             # 如果没有内容且还有重试次数
@@ -267,9 +278,15 @@ class ChatChannel(Channel):
             # IMAGE类型如果被添加到pending_image_create，也不发送错误消息
             elif context.type == ContextType.IMAGE and context.get("session_id") in pending_image_create:
                 logger.info("[chat_channel] IMAGE added to IMAGE_CREATE, no error reply needed")
+            # IMAGE类型如果被添加到pending_text_messages，也不发送错误消息
+            elif context.type == ContextType.IMAGE and context.get("session_id") in pending_text_messages:
+                logger.info("[chat_channel] IMAGE added to TEXT task, no error reply needed")
             # TEXT类型如果更新了pending_image_create，也不发送错误消息
             elif context.type == ContextType.TEXT and context.get("session_id") in pending_image_create:
                 logger.info("[chat_channel] TEXT updated IMAGE_CREATE prompt, no error reply needed")
+            # TEXT类型如果已经提交到pending_text_messages进行异步处理，也不发送错误消息
+            elif context.type == ContextType.TEXT and context.get("session_id") in pending_text_messages:
+                logger.info("[chat_channel] TEXT submitted for async processing, no error reply needed")
             else:
                 # 处理空回复的情况,给用户明确的反馈
                 logger.error(f"[chat_channel] reply is empty after {retry_count} attempts, context: {context}")
@@ -307,14 +324,21 @@ class ChatChannel(Channel):
                     if session_id and session_id in pending_text_messages:
                         # 有待处理的文本，说明这是新的文本消息，取消之前的
                         old_pending = pending_text_messages[session_id]
+                        old_pending["cancelled"] = True  # 设置取消标志，让旧任务知道被取消了
                         if "future" in old_pending and not old_pending["future"].done():
                             old_pending["future"].cancel()
                             logger.info("[chat_channel] cancelled previous pending text message")
 
                     # 立即开始处理文本消息（异步）
-                    logger.info(f"[chat_channel] text message received, start processing immediately and wait {TEXT_WAIT_TIME}s for possible image...")
+                    logger.info(f"[chat_channel] text message received, start processing immediately and wait for possible image...")
 
                     def immediate_text_handler():
+                        # 保存对自己数据的引用（重要！防止被新任务覆盖后读取错误数据）
+                        my_pending = pending_text_messages.get(session_id)
+                        if not my_pending:
+                            logger.info("[chat_channel] TEXT task data not found, skip")
+                            return
+
                         # 立即处理文本消息
                         pending_context = context
                         pending_context["channel"] = e_context["channel"]
@@ -322,34 +346,89 @@ class ChatChannel(Channel):
                         logger.info("[chat_channel] processing text message immediately...")
                         text_reply = super(ChatChannel, self).build_reply_content(pending_context.content, pending_context)
 
-                        # 保存处理结果
-                        if session_id in pending_text_messages:
-                            pending_text_messages[session_id]["reply"] = text_reply
+                        # 保存处理结果到自己的数据中
+                        my_pending["reply"] = text_reply
 
-                        # 等待指定时间，看是否有图片到来
-                        time.sleep(TEXT_WAIT_TIME)
+                        # 动态等待：初始等待10秒，收到图片后重置为20秒
+                        logger.info(f"[chat_channel] waiting for possible image (initial {TEXT_WAIT_TIME}s, then {IMAGE_WAIT_TIME}s after each image)...")
+                        time.sleep(TEXT_WAIT_TIME)  # 初始等待10秒
 
-                        # 检查是否被取消（被图片消息取消）
-                        if session_id in pending_text_messages and not pending_text_messages[session_id].get("cancelled", False):
-                            # 没有被取消，发送之前处理好的回复
-                            logger.info("[chat_channel] no image received within timeout, sending text reply")
-                            del pending_text_messages[session_id]
+                        # 动态等待循环：检查是否有新图片
+                        max_total_wait = 180  # 最大总等待时间（秒）
+                        total_waited = TEXT_WAIT_TIME
+                        while total_waited < max_total_wait:
+                            # 检查是否被取消（使用自己的数据引用）
+                            if my_pending.get("cancelled", False):
+                                logger.info("[chat_channel] TEXT task was cancelled during waiting, will process existing images")
+                                break  # 退出等待，但继续处理已有的图片
 
-                            if text_reply and text_reply.content:
-                                text_reply = self._decorate_reply(pending_context, text_reply)
-                                self._send_reply(pending_context, text_reply)
-                        else:
-                            # 被取消了，说明收到了图片，图片处理会合并文本
-                            logger.info("[chat_channel] text message was merged with image, skip sending")
-                            if session_id in pending_text_messages:
+                            last_image_time = my_pending.get("last_image_time")
+                            if last_image_time:
+                                time_since_last_image = time.time() - last_image_time
+                                # 如果距离最后一张图片超过20秒，开始处理
+                                if time_since_last_image >= IMAGE_WAIT_TIME:
+                                    logger.info(f"[chat_channel] {IMAGE_WAIT_TIME}s passed since last image, processing...")
+                                    break
+                                # 否则继续等待
+                                remaining = IMAGE_WAIT_TIME - time_since_last_image
+                                logger.debug(f"[chat_channel] waiting for more images, {remaining:.1f}s remaining...")
+                                time.sleep(2)
+                                total_waited += 2
+                            else:
+                                # 没有收到图片，退出等待
+                                break
+
+                        # 使用自己的数据（不再从 pending_text_messages[session_id] 读取）
+                        images = my_pending.get("images", [])
+
+                        if images:
+                            # 有图片，进行图片+文本组合处理
+                            logger.info(f"[chat_channel] found {len(images)} images, processing with text query...")
+                            text_query = pending_context.content
+
+                            # 清理pending（只有当这个任务还是当前任务时才删除）
+                            if pending_text_messages.get(session_id) is my_pending:
                                 del pending_text_messages[session_id]
+
+                            # 对每张图片进行识别，带上文本问题
+                            for i, img_path in enumerate(images):
+                                logger.info(f"[chat_channel] processing image {i+1}/{len(images)} with query: {text_query[:30]}...")
+                                # 构造图片识别的context
+                                img_context = Context(ContextType.IMAGE, img_path)
+                                img_context.kwargs = pending_context.kwargs.copy()
+                                img_context["img_query"] = text_query
+                                img_context["channel"] = pending_context.get("channel")
+
+                                # 调用图片识别
+                                img_reply = super(ChatChannel, self).build_reply_content(img_path, img_context)
+
+                                if img_reply and img_reply.content:
+                                    img_reply = self._decorate_reply(img_context, img_reply)
+                                    self._send_reply(img_context, img_reply)
+                        else:
+                            # 没有图片
+                            if my_pending.get("cancelled", False):
+                                # 被取消且没有图片，不发送回复
+                                logger.info("[chat_channel] TEXT task was cancelled with no images, skip sending")
+                            else:
+                                # 没有被取消，发送文本回复
+                                logger.info("[chat_channel] no image received within timeout, sending text reply")
+                                # 清理pending（只有当这个任务还是当前任务时才删除）
+                                if pending_text_messages.get(session_id) is my_pending:
+                                    del pending_text_messages[session_id]
+
+                                if text_reply and text_reply.content:
+                                    text_reply = self._decorate_reply(pending_context, text_reply)
+                                    self._send_reply(pending_context, text_reply)
 
                     # 保存待处理的文本消息
                     pending_text_messages[session_id] = {
                         "context": context,
                         "time": time.time(),
                         "reply": None,
-                        "cancelled": False
+                        "cancelled": False,
+                        "images": [],  # 收到的图片列表
+                        "last_image_time": None  # 最后收到图片的时间
                     }
 
                     # 提交立即处理任务
@@ -377,11 +456,35 @@ class ChatChannel(Channel):
                             from concurrent.futures import ThreadPoolExecutor, as_completed
                             kgapi = KGAPIImage()
 
-                            # 等待10秒，接收用户的图片和描述
-                            logger.info(f"[chat_channel] waiting {TEXT_WAIT_TIME}s to receive user input (images/descriptions)...")
-                            time.sleep(TEXT_WAIT_TIME)
+                            # 动态等待：每收到一张图片就重置倒计时
+                            # 初始等待10秒，之后每次检查距离最后一张图片是否超过20秒
+                            logger.info(f"[chat_channel] waiting for user input (initial {TEXT_WAIT_TIME}s, then {IMAGE_WAIT_TIME}s after each image)...")
+                            time.sleep(TEXT_WAIT_TIME)  # 初始等待10秒
 
-                            # 10秒后，检查pending_image_create的状态
+                            # 动态等待循环：检查是否有新图片
+                            max_total_wait = 180  # 最大总等待时间（秒），防止无限等待
+                            total_waited = TEXT_WAIT_TIME
+                            while total_waited < max_total_wait:
+                                if session_id not in pending_image_create:
+                                    logger.info("[chat_channel] IMAGE_CREATE task was cancelled or removed")
+                                    return
+
+                                pending = pending_image_create[session_id]
+                                last_image_time = pending.get("last_image_time", pending["time"])
+                                time_since_last_image = time.time() - last_image_time
+
+                                # 如果距离最后一张图片超过20秒，开始处理
+                                if time_since_last_image >= IMAGE_WAIT_TIME:
+                                    logger.info(f"[chat_channel] {IMAGE_WAIT_TIME}s passed since last image, starting processing...")
+                                    break
+
+                                # 否则继续等待，每2秒检查一次
+                                remaining = IMAGE_WAIT_TIME - time_since_last_image
+                                logger.debug(f"[chat_channel] waiting for more images, {remaining:.1f}s remaining...")
+                                time.sleep(2)
+                                total_waited += 2
+
+                            # 检查pending_image_create的状态
                             if session_id not in pending_image_create:
                                 logger.info("[chat_channel] IMAGE_CREATE task was cancelled or removed")
                                 return
@@ -519,22 +622,24 @@ class ChatChannel(Channel):
             elif context.type == ContextType.IMAGE:  # 图片消息，进行图片识别
                 session_id = context.get("session_id")
 
-                # 检查是否有待处理的文本消息
-                text_query = None
+                # 检查是否有待处理的文本消息（用于图片+文本组合处理）
                 if session_id and session_id in pending_text_messages:
-                    # 有待处理的文本，合并处理
+                    # 有待处理的文本，将图片添加到列表
                     pending = pending_text_messages[session_id]
-                    text_context = pending["context"]
-                    text_query = text_context.content
 
-                    logger.info(f"[chat_channel] found pending text message, merging with image: {text_query[:50]}...")
+                    # 确保图片已下载
+                    cmsg = context["msg"]
+                    cmsg.prepare()
 
-                    # 取消延迟任务
-                    if "future" in pending and not pending["future"].done():
-                        pending["future"].cancel()
+                    # 添加图片到列表
+                    pending["images"].append(context.content)
 
-                    # 从待处理队列中移除
-                    del pending_text_messages[session_id]
+                    # 更新最后收到图片的时间，重置倒计时
+                    pending["last_image_time"] = time.time()
+                    logger.info(f"[chat_channel] image added to TEXT task (total: {len(pending['images'])}), countdown reset to {IMAGE_WAIT_TIME}s")
+
+                    # 不在这里处理，让异步任务处理
+                    return Reply()
 
                 # 检查是否有待处理的生图请求（用于图生图）
                 if session_id and session_id in pending_image_create:
@@ -551,11 +656,11 @@ class ChatChannel(Channel):
                     # 添加参考图片路径
                     pending["ref_images"].append(context.content)
 
-                    # 不要立即调用图生图API，让异步任务在10秒后统一处理
-                    # 这样图生图也可以在后台运行，不会阻塞
-                    logger.info("[chat_channel] reference image added, will be processed by async task")
+                    # 更新最后收到图片的时间，重置倒计时
+                    pending["last_image_time"] = time.time()
+                    logger.info(f"[chat_channel] reference image added (total: {len(pending['ref_images'])}), countdown reset to {IMAGE_WAIT_TIME}s")
 
-                    # 不在这里发送提示消息，等10秒窗口结束后统一发送
+                    # 不在这里发送提示消息，等倒计时结束后统一发送
                     # 这样可以准确显示收到的图片数量
                     return Reply()
 
@@ -569,10 +674,11 @@ class ChatChannel(Channel):
                     "time": time.time()
                 }
 
-                # 等待3秒，看是否有"生图"文本到来
-                # 如果有，这张图片会被添加到pending_image_create，不需要进行图片识别
-                logger.info("[chat_channel] image received, waiting 3s to check if IMAGE_CREATE will come...")
-                time.sleep(3)
+                # 等待10秒，看是否有"生图"或普通文本到来
+                # 如果有，这张图片会被添加到对应的pending队列，不需要单独进行图片识别
+                # 注：手机端图片和文字是分开的输入框，需要足够的等待时间
+                logger.info("[chat_channel] image received, waiting 10s to check if TEXT or IMAGE_CREATE will come...")
+                time.sleep(10)
 
                 # 检查是否已经有pending_image_create（用户发送了"生图"文本）
                 if session_id in pending_image_create:
@@ -587,12 +693,18 @@ class ChatChannel(Channel):
                         logger.info("[chat_channel] image added to IMAGE_CREATE after waiting, skip image recognition")
                         return Reply()
 
-                # 没有pending_image_create，进行正常的图片识别
-                logger.info("[chat_channel] no IMAGE_CREATE found, processing image message: {}".format(context.content))
+                # 再次检查是否有pending_text_messages（用户在等待期间发送了文本）
+                if session_id in pending_text_messages:
+                    pending = pending_text_messages[session_id]
+                    # 添加图片到列表
+                    pending["images"].append(context.content)
+                    # 更新最后收到图片的时间，重置倒计时
+                    pending["last_image_time"] = time.time()
+                    logger.info(f"[chat_channel] image added to TEXT task after waiting (total: {len(pending['images'])}), countdown reset to {IMAGE_WAIT_TIME}s")
+                    return Reply()
 
-                # 如果有文本，将其传递给 bot
-                if text_query:
-                    context["img_query"] = text_query
+                # 没有pending_image_create也没有pending_text_messages，进行正常的图片识别
+                logger.info("[chat_channel] no pending task found, processing image message: {}".format(context.content))
 
                 context["channel"] = e_context["channel"]
                 reply = super().build_reply_content(context.content, context)

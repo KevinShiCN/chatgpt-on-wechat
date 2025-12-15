@@ -191,8 +191,8 @@ class Query:
             raise web.Forbidden()
         msg = parse_message(message)
         logger.debug("[wechatcom] receive message: {}, msg= {}".format(message, msg))
-        logger.info(f"[wechatcom] receive message type: {msg.type}")  # 添加消息类型日志
         if msg.type == "event":
+            logger.debug(f"[wechatcom] receive event: {msg.event}")  # event 用 debug 级别，避免刷屏
             if msg.event == "subscribe":
                 pass
                 # reply_content = subscribe_msg()

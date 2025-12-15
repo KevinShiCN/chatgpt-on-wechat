@@ -26,7 +26,11 @@ MESSAGE_EXPIRY = 300  # 消息ID缓存过期时间（秒）
 
 # 待处理的文本消息（等待可能的图片）
 pending_text_messages = {}  # {session_id: {"context": context, "time": timestamp, "future": future, "reply": reply, "cancelled": False}}
-TEXT_WAIT_TIME = 20  # 等待图片的时间（秒）
+TEXT_WAIT_TIME = 10  # 等待图片的时间（秒）
+
+# 待处理的生图消息（等待可能的参考图片）
+pending_image_create = {}  # {session_id: {"context": context, "time": timestamp, "future": future, "result": result, "cancelled": False, "ref_images": []}}
+
 
 
 def cleanup_expired_cache():
@@ -288,9 +292,76 @@ class ChatChannel(Channel):
                     # 不返回 reply，由异步任务处理
                     return Reply()
                 else:
-                    # IMAGE_CREATE 类型正常处理
-                    context["channel"] = e_context["channel"]
-                    reply = super().build_reply_content(context.content, context)
+                    # IMAGE_CREATE 类型延迟处理，等待可能的参考图片
+                    session_id = context.get("session_id")
+                    
+                    # 检查是否配置了 nano-banana 生图模型
+                    kgapi_model = conf().get("kgapi_image_model", "")
+                    if not kgapi_model or not kgapi_model.startswith("nano-banana"):
+                        # 未配置 nano-banana 模型，使用原有逻辑
+                        context["channel"] = e_context["channel"]
+                        reply = super().build_reply_content(context.content, context)
+                    else:
+                        # 使用KGAPI，延迟处理等待参考图片
+                        logger.info(f"[chat_channel] IMAGE_CREATE received, start processing and wait {TEXT_WAIT_TIME}s for possible reference image...")
+                        
+                        def immediate_image_create_handler():
+                            from bot.kgapi.kgapi_image import KGAPIImage
+                            kgapi = KGAPIImage()
+                            
+                            # 立即开始文生图
+                            logger.info("[chat_channel] starting image generation...")
+                            ok, result = kgapi.create_img(context.content)
+                            
+                            # 保存处理结果
+                            if session_id in pending_image_create:
+                                pending_image_create[session_id]["result"] = (ok, result)
+                            
+                            # 等待指定时间，看是否有参考图片到来
+                            time.sleep(TEXT_WAIT_TIME)
+                            
+                            # 检查是否被取消（收到了参考图片）
+                            if session_id in pending_image_create and not pending_image_create[session_id].get("cancelled", False):
+                                # 没有被取消，发送文生图结果
+                                logger.info("[chat_channel] no reference image received, sending generated image")
+                                ref_images = pending_image_create[session_id].get("ref_images", [])
+                                del pending_image_create[session_id]
+                                
+                                if ref_images:
+                                    # 有参考图片，改用图生图
+                                    logger.info(f"[chat_channel] found {len(ref_images)} reference images, switching to edit mode")
+                                    ok, result = kgapi.edit_img(context.content, ref_images)
+                                
+                                if ok:
+                                    img_reply = Reply(ReplyType.IMAGE_URL, result)
+                                else:
+                                    img_reply = Reply(ReplyType.ERROR, result)
+                                
+                                img_reply = self._decorate_reply(context, img_reply)
+                                self._send_reply(context, img_reply)
+                            else:
+                                # 被取消了，由图片处理逻辑负责
+                                logger.info("[chat_channel] image create was merged with reference images")
+                                if session_id in pending_image_create:
+                                    del pending_image_create[session_id]
+                        
+                        # 保存待处理的生图消息
+                        pending_image_create[session_id] = {
+                            "context": context,
+                            "time": time.time(),
+                            "result": None,
+                            "cancelled": False,
+                            "ref_images": []
+                        }
+                        
+                        context["channel"] = e_context["channel"]
+                        
+                        # 提交异步处理任务
+                        future = handler_pool.submit(immediate_image_create_handler)
+                        pending_image_create[session_id]["future"] = future
+                        
+                        # 不返回 reply，由异步任务处理
+                        return Reply()
             elif context.type == ContextType.VOICE:  # 语音消息
                 cmsg = context["msg"]
                 cmsg.prepare()
@@ -337,6 +408,40 @@ class ChatChannel(Channel):
 
                     # 从待处理队列中移除
                     del pending_text_messages[session_id]
+
+                # 检查是否有待处理的生图请求（用于图生图）
+                if session_id and session_id in pending_image_create:
+                    # 有待处理的生图请求，将此图片作为参考图片
+                    pending = pending_image_create[session_id]
+                    img_create_context = pending["context"]
+                    
+                    logger.info(f"[chat_channel] found pending image create, adding reference image for: {img_create_context.content[:50]}...")
+                    
+                    # 确保图片已下载
+                    cmsg = context["msg"]
+                    cmsg.prepare()
+                    
+                    # 添加参考图片路径
+                    pending["ref_images"].append(context.content)
+                    
+                    # 标记为已取消，由图生图处理
+                    pending["cancelled"] = True
+                    
+                    # 使用KGAPI进行图生图
+                    from bot.kgapi.kgapi_image import KGAPIImage
+                    kgapi = KGAPIImage()
+                    
+                    ok, result = kgapi.edit_img(img_create_context.content, pending["ref_images"])
+                    
+                    # 清理待处理队列
+                    del pending_image_create[session_id]
+                    
+                    if ok:
+                        reply = Reply(ReplyType.IMAGE_URL, result)
+                    else:
+                        reply = Reply(ReplyType.ERROR, result)
+                    
+                    return reply
 
                 # 保存图片到缓存（用于某些插件）
                 memory.USER_IMAGE_CACHE[session_id] = {

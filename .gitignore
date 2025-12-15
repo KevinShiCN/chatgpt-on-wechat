@@ -36,3 +36,5 @@ plugins/banwords/lib/__pycache__
 !plugins/agent
 client_config.json
 .claude/
+CLAUDE.md
+**/CLAUDE.md

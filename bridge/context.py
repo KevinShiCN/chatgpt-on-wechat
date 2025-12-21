@@ -25,10 +25,11 @@ class ContextType(Enum):
 
 
 class Context:
-    def __init__(self, type: ContextType = None, content=None, kwargs=dict()):
+    def __init__(self, type: ContextType = None, content=None, kwargs=None):
         self.type = type
         self.content = content
-        self.kwargs = kwargs
+        # 修复可变默认参数问题：每个实例使用独立的字典
+        self.kwargs = kwargs if kwargs is not None else {}
 
     def __contains__(self, key):
         if key == "type":

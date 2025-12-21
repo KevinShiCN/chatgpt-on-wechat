@@ -74,8 +74,8 @@ class ChatChannel(Channel):
         if not content:
             return conf().get("gacha_default_count", 3), ""
 
-        # 匹配开头的数字（抽卡次数）
-        match = re.match(r'^(\d+)\s*(.*)$', content)
+        # 匹配开头的数字（抽卡次数），使用 re.DOTALL 让 .* 匹配换行符
+        match = re.match(r'^(\d+)\s*(.*)', content, re.DOTALL)
 
         if match:
             count = int(match.group(1))
@@ -605,7 +605,10 @@ class ChatChannel(Channel):
                             del pending_image_create[session_id]
 
                             # 发送结果
-                            if ok:
+                            if ok == "text":
+                                # API返回了文字分析而非图片（如网络拓扑图等技术性图表）
+                                img_reply = Reply(ReplyType.TEXT, f"[AI分析]\n{result}")
+                            elif ok:
                                 img_reply = Reply(ReplyType.IMAGE_URL, result)
                             else:
                                 img_reply = Reply(ReplyType.ERROR, result)
@@ -658,6 +661,12 @@ class ChatChannel(Channel):
                     from bot.kgapi.kgapi_image import KGAPIImage
                     kgapi = KGAPIImage()
 
+                    # 获取当前请求的时间戳，用于判断是否被新请求覆盖
+                    if session_id not in pending_image_create:
+                        logger.info("[chat_channel] GACHA task was cancelled before start")
+                        return
+                    my_request_time = pending_image_create[session_id].get("request_time", 0)
+
                     # 动态等待参考图片（复用现有机制）
                     logger.info(f"[chat_channel] GACHA waiting for user input (initial {TEXT_WAIT_TIME}s)...")
                     time.sleep(TEXT_WAIT_TIME)
@@ -671,6 +680,12 @@ class ChatChannel(Channel):
                             return
 
                         pending = pending_image_create[session_id]
+
+                        # 检查是否被新请求覆盖
+                        if pending.get("request_time", 0) != my_request_time:
+                            logger.info("[chat_channel] GACHA task was superseded by a new request")
+                            return
+
                         last_image_time = pending.get("last_image_time", pending["time"])
                         time_since_last_image = time.time() - last_image_time
 
@@ -686,9 +701,16 @@ class ChatChannel(Channel):
                         return
 
                     pending = pending_image_create[session_id]
+
+                    # 再次检查是否被新请求覆盖
+                    if pending.get("request_time", 0) != my_request_time:
+                        logger.info("[chat_channel] GACHA task was superseded by a new request")
+                        return
+
                     ref_images = pending.get("ref_images", [])
                     final_content = pending["context"].content
-                    gacha_count_final = pending["context"].get("gacha_count", gacha_count)
+                    # 从 pending context 获取 gacha_count，不使用闭包变量
+                    gacha_count_final = pending["context"].kwargs.get("gacha_count", conf().get("gacha_default_count", 3))
 
                     # 检查是否有内容
                     if not final_content and not ref_images:
@@ -698,59 +720,96 @@ class ChatChannel(Channel):
 
                     # 发送开始提示
                     mode_text = "图生图" if ref_images else "文生图"
-                    start_msg = f"开始抽卡，共{gacha_count_final}张（{mode_text}模式），请耐心等待...\n提示词：{final_content}"
+                    start_msg = f"开始抽卡，共{gacha_count_final}张（{mode_text}模式，并行生成），请耐心等待...\n提示词：{final_content}"
                     if ref_images:
                         start_msg += f"\n参考图片：{len(ref_images)}张"
                     start_reply = Reply(ReplyType.TEXT, start_msg)
                     start_reply = self._decorate_reply(context, start_reply)
                     self._send_reply(context, start_reply)
 
+                    # 定期提醒功能（整体计时）
+                    reminder_stop = threading.Event()
+                    completed_count = [0]  # 使用列表以便在闭包中修改
+                    def send_gacha_reminder():
+                        """每60秒发送一次进度提醒"""
+                        minute = 1
+                        while not reminder_stop.is_set():
+                            if reminder_stop.wait(60):  # 等待60秒或被停止
+                                break
+                            if not reminder_stop.is_set():
+                                reminder_msg = f"正在并行生成{gacha_count_final}张图片，已完成{completed_count[0]}张，已等待{minute}分钟，请继续耐心等待..."
+                                reminder_reply = Reply(ReplyType.TEXT, reminder_msg)
+                                reminder_reply = self._decorate_reply(context, reminder_reply)
+                                self._send_reply(context, reminder_reply)
+                                logger.info(f"[chat_channel] GACHA sent reminder: {completed_count[0]}/{gacha_count_final} completed, {minute} minute(s) elapsed")
+                                minute += 1
+
+                    # 启动提醒线程
+                    reminder_thread = threading.Thread(target=send_gacha_reminder, daemon=True)
+                    reminder_thread.start()
+
+                    # 定义单个图片生成任务
+                    def generate_single_image(img_index):
+                        """生成单张图片，返回 (index, ok, result)"""
+                        try:
+                            logger.info(f"[chat_channel] GACHA generating image {img_index+1}/{gacha_count_final}...")
+                            if ref_images:
+                                ok, result = kgapi.edit_img(final_content, ref_images)
+                            else:
+                                ok, result = kgapi.create_img(final_content)
+                            return (img_index, ok, result)
+                        except Exception as e:
+                            logger.error(f"[chat_channel] GACHA image {img_index+1}/{gacha_count_final} exception: {e}")
+                            return (img_index, False, str(e))
+
+                    # 并行生成所有图片
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+                    results = []
                     success_count = 0
                     fail_count = 0
 
-                    # 循环生成图片
-                    for i in range(gacha_count_final):
-                        logger.info(f"[chat_channel] GACHA generating image {i+1}/{gacha_count_final}...")
+                    with ThreadPoolExecutor(max_workers=gacha_count_final) as executor:
+                        # 提交所有任务
+                        futures = {executor.submit(generate_single_image, i): i for i in range(gacha_count_final)}
 
-                        try:
-                            if ref_images:
-                                # 图生图模式
-                                ok, result = kgapi.edit_img(final_content, ref_images)
-                            else:
-                                # 文生图模式
-                                ok, result = kgapi.create_img(final_content)
+                        # 按完成顺序处理结果
+                        for future in as_completed(futures):
+                            img_index, ok, result = future.result()
+                            completed_count[0] += 1
 
-                            if ok:
+                            if ok == "text":
+                                # API返回了文字分析而非图片
+                                text_reply = Reply(ReplyType.TEXT, f"[AI分析] 第{img_index+1}张:\n{result}")
+                                text_reply = self._decorate_reply(context, text_reply)
+                                self._send_reply(context, text_reply)
+                                success_count += 1
+                                logger.info(f"[chat_channel] GACHA image {img_index+1}/{gacha_count_final} returned text analysis")
+                            elif ok:
                                 # 发送图片
                                 img_reply = Reply(ReplyType.IMAGE_URL, result)
                                 img_reply = self._decorate_reply(context, img_reply)
                                 self._send_reply(context, img_reply)
 
                                 # 发送进度提示
-                                progress_msg = f"第{i+1}/{gacha_count_final}张生成完成"
+                                progress_msg = f"第{img_index+1}张生成完成（{completed_count[0]}/{gacha_count_final}）"
                                 progress_reply = Reply(ReplyType.TEXT, progress_msg)
                                 progress_reply = self._decorate_reply(context, progress_reply)
                                 self._send_reply(context, progress_reply)
 
                                 success_count += 1
-                                logger.info(f"[chat_channel] GACHA image {i+1}/{gacha_count_final} success")
+                                logger.info(f"[chat_channel] GACHA image {img_index+1}/{gacha_count_final} success")
                             else:
                                 # 生成失败
-                                fail_msg = f"第{i+1}/{gacha_count_final}张生成失败: {result}"
+                                fail_msg = f"第{img_index+1}张生成失败: {result}"
                                 fail_reply = Reply(ReplyType.TEXT, fail_msg)
                                 fail_reply = self._decorate_reply(context, fail_reply)
                                 self._send_reply(context, fail_reply)
 
                                 fail_count += 1
-                                logger.warning(f"[chat_channel] GACHA image {i+1}/{gacha_count_final} failed: {result}")
-                        except Exception as e:
-                            fail_msg = f"第{i+1}/{gacha_count_final}张生成异常: {str(e)}"
-                            fail_reply = Reply(ReplyType.TEXT, fail_msg)
-                            fail_reply = self._decorate_reply(context, fail_reply)
-                            self._send_reply(context, fail_reply)
+                                logger.warning(f"[chat_channel] GACHA image {img_index+1}/{gacha_count_final} failed: {result}")
 
-                            fail_count += 1
-                            logger.error(f"[chat_channel] GACHA image {i+1}/{gacha_count_final} exception: {e}")
+                    # 停止提醒线程
+                    reminder_stop.set()
 
                     # 清理待处理队列
                     if session_id in pending_image_create:
@@ -778,9 +837,11 @@ class ChatChannel(Channel):
                             logger.info(f"[chat_channel] GACHA found recent image from cache: {img_path}")
 
                 # 保存待处理的抽卡消息（复用 pending_image_create）
+                request_time = time.time()
                 pending_image_create[session_id] = {
                     "context": context,
-                    "time": time.time(),
+                    "time": request_time,
+                    "request_time": request_time,  # 用于判断是否被新请求覆盖
                     "result": None,
                     "cancelled": False,
                     "ref_images": recent_images

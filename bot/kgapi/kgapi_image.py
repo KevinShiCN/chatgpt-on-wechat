@@ -65,6 +65,11 @@ class KGAPIImage:
 
             # 解析 aspect_ratio
             aspect_ratio, cleaned_query = self.parse_aspect_ratio(query)
+
+            # 强制添加生图指令，避免 API 返回文字分析而非图片
+            if "直接生成图片" not in cleaned_query:
+                cleaned_query = cleaned_query.rstrip() + "\n\n直接生成图片，不要返回文字分析。"
+
             logger.info(f"[KGAPI] create_img query={cleaned_query}, aspect_ratio={aspect_ratio}")
 
             url = f"{self.api_base}/images/generations"
@@ -83,22 +88,48 @@ class KGAPIImage:
                 if aspect_ratio:
                     data["aspect_ratio"] = aspect_ratio
 
-            res = requests.post(url, headers=headers, json=data, timeout=(5, 120))
+            # 连接超时10秒，读取超时600秒（10分钟），因为复杂图片生成可能需要较长时间
+            res = requests.post(url, headers=headers, json=data, timeout=(10, 600))
             res.raise_for_status()
 
             result = res.json()
-            image_url = result["data"][0]["url"]
+            logger.debug(f"[KGAPI] create_img API response: {result}")
+
+            # 检查返回数据结构
+            if "data" not in result or not result["data"]:
+                error_msg = result.get("error", {}).get("message") if isinstance(result.get("error"), dict) else str(result.get("error", result))
+                logger.error(f"[KGAPI] create_img API返回异常，完整响应: {result}")
+                return False, f"生图失败: API返回异常({error_msg})，请联系管理员干饭CEO"
+
+            image_url = result["data"][0].get("url")
+            if not image_url:
+                # 检查是否有 revised_prompt（API 可能返回文字分析而非图片）
+                revised_prompt = result["data"][0].get("revised_prompt")
+                if revised_prompt:
+                    logger.warning(f"[KGAPI] create_img API返回文字分析而非图片，长度: {len(revised_prompt)}")
+                    # 返回特殊标记，让调用方知道这是文字内容
+                    return "text", revised_prompt
+                logger.error(f"[KGAPI] create_img API未返回url字段，data[0]: {result['data'][0]}")
+                return False, "生图失败: API未返回图片URL，请联系管理员干饭CEO"
+
             logger.info(f"[KGAPI] create_img success, url={image_url}")
             return True, image_url
 
         except requests.exceptions.Timeout:
-            if retry_count < 2:
+            logger.error(f"[KGAPI] create_img timeout, retry_count={retry_count}")
+            # 单次已等待10分钟，最多重试1次
+            if retry_count < 1:
                 time.sleep(2)
                 return self.create_img(query, retry_count + 1, api_key)
-            return False, "生图超时"
+            return False, "生图超时（已等待超过10分钟），请联系管理员干饭CEO"
+        except requests.exceptions.RequestException as e:
+            logger.error(f"[KGAPI] create_img request error: {type(e).__name__}: {e}")
+            return False, f"生图请求失败: {str(e)}，请联系管理员干饭CEO"
         except Exception as e:
-            logger.error(f"[KGAPI] create_img error: {e}")
-            return False, f"生图失败: {str(e)}"
+            logger.error(f"[KGAPI] create_img error: {type(e).__name__}: {e}")
+            import traceback
+            logger.error(f"[KGAPI] create_img traceback: {traceback.format_exc()}")
+            return False, f"生图失败: {str(e)}，请联系管理员干饭CEO"
 
     def edit_img(self, query, image_paths, retry_count=0, api_key=None):
         """图生图"""
@@ -163,7 +194,19 @@ class KGAPIImage:
             res.raise_for_status()
 
             result = res.json()
-            image_url = result["data"][0]["url"]
+            logger.debug(f"[KGAPI] edit_img API response: {result}")
+
+            # 检查返回数据结构
+            if "data" not in result or not result["data"]:
+                error_msg = result.get("error", {}).get("message") if isinstance(result.get("error"), dict) else str(result.get("error", result))
+                logger.error(f"[KGAPI] edit_img API返回异常，完整响应: {result}")
+                return False, f"图生图失败: API返回异常({error_msg})，请联系管理员干饭CEO"
+
+            image_url = result["data"][0].get("url")
+            if not image_url:
+                logger.error(f"[KGAPI] edit_img API未返回url字段，data[0]: {result['data'][0]}")
+                return False, "图生图失败: API未返回图片URL，请联系管理员干饭CEO"
+
             logger.info(f"[KGAPI] edit_img success, url={image_url}")
             return True, image_url
 
@@ -174,12 +217,12 @@ class KGAPIImage:
                 logger.info(f"[KGAPI] retrying edit_img ({retry_count + 1}/2)...")
                 time.sleep(2)
                 return self.edit_img(query, image_paths, retry_count + 1, api_key)
-            return False, f"图生图超时（已重试{retry_count}次）"
+            return False, f"图生图超时（已重试{retry_count}次），请联系管理员干饭CEO"
         except requests.exceptions.RequestException as e:
             logger.error(f"[KGAPI] edit_img request error: {type(e).__name__}: {e}")
-            return False, f"图生图请求失败: {str(e)}"
+            return False, f"图生图请求失败: {str(e)}，请联系管理员干饭CEO"
         except Exception as e:
             logger.error(f"[KGAPI] edit_img error: {type(e).__name__}: {e}")
             import traceback
-            logger.error(f"[KGAPI] traceback: {traceback.format_exc()}")
-            return False, f"图生图失败: {str(e)}"
+            logger.error(f"[KGAPI] edit_img traceback: {traceback.format_exc()}")
+            return False, f"图生图失败: {str(e)}，请联系管理员干饭CEO"

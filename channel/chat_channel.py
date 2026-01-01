@@ -11,6 +11,7 @@ from channel.channel import Channel
 from common.dequeue import Dequeue
 from common import memory
 from common.error_notify import notify_channel_error
+from common.request_log import RequestTimer
 from plugins import *
 
 try:
@@ -243,6 +244,11 @@ class ChatChannel(Channel):
         if not context.content and context.type not in [ContextType.IMAGE_CREATE, ContextType.GACHA_CREATE]:
             return
 
+        # 创建请求计时器（用于记录请求日志）
+        request_timer = RequestTimer(context)
+        # 立即记录请求开始（防止中途崩溃丢失日志）
+        request_timer.log_start()
+
         # 消息去重检查
         msg_id = None
         if context.get("msg"):
@@ -320,6 +326,14 @@ class ChatChannel(Channel):
 
             # reply的发送步骤
             self._send_reply(context, reply)
+
+            # 记录请求日志（同步请求，非异步处理的类型）
+            # 异步类型（TEXT走异步、IMAGE_CREATE、GACHA_CREATE）在各自的异步处理中记录
+            if context.type not in [ContextType.IMAGE_CREATE, ContextType.GACHA_CREATE]:
+                session_id = context.get("session_id")
+                # TEXT如果走了异步处理，不在这里记录（异步处理中会记录）
+                if not (context.type == ContextType.TEXT and session_id and session_id in pending_text_messages):
+                    request_timer.log(reply)
         else:
             # IMAGE_CREATE和GACHA_CREATE类型使用异步处理，空reply是正常的，不发送错误消息
             if context.type in [ContextType.IMAGE_CREATE, ContextType.GACHA_CREATE]:
@@ -342,6 +356,9 @@ class ChatChannel(Channel):
                 error_reply = Reply(ReplyType.ERROR, f"抱歉,我尝试了 {retry_count} 次但仍无法生成回复,请稍后再试")
                 error_reply = self._decorate_reply(context, error_reply)
                 self._send_reply(context, error_reply)
+
+                # 记录失败的请求日志（兜底：所有类型都记录）
+                request_timer.log(error_reply)
 
     def _generate_reply(self, context: Context, reply: Reply = Reply()) -> Reply:
         e_context = PluginManager().emit_event(
@@ -470,10 +487,15 @@ class ChatChannel(Channel):
                                     text_reply = self._decorate_reply(pending_context, text_reply)
                                     self._send_reply(pending_context, text_reply)
 
+                                    # 记录异步请求日志
+                                    from common.request_log import log_request
+                                    log_request(pending_context, text_reply, my_pending.get("start_time"))
+
                     # 保存待处理的文本消息
                     pending_text_messages[session_id] = {
                         "context": context,
                         "time": time.time(),
+                        "start_time": time.time(),  # 请求开始时间（用于日志记录）
                         "reply": None,
                         "cancelled": False,
                         "images": [],  # 收到的图片列表
@@ -601,7 +623,8 @@ class ChatChannel(Channel):
                                 del pending_image_create[session_id]
                                 return
 
-                            # 清理待处理队列
+                            # 清理待处理队列（先保存开始时间用于日志）
+                            start_time = pending_image_create.get(session_id, {}).get("time")
                             del pending_image_create[session_id]
 
                             # 发送结果
@@ -615,6 +638,10 @@ class ChatChannel(Channel):
 
                             img_reply = self._decorate_reply(context, img_reply)
                             self._send_reply(context, img_reply)
+
+                            # 记录生图请求日志
+                            from common.request_log import log_request
+                            log_request(context, img_reply, start_time)
                         
                         # 检查是否有最近的图片（用户可能先发图片后发"生图"文本）
                         recent_images = []
@@ -762,17 +789,14 @@ class ChatChannel(Channel):
                             logger.error(f"[chat_channel] GACHA image {img_index+1}/{gacha_count_final} exception: {e}")
                             return (img_index, False, str(e))
 
-                    # 并行生成所有图片
+                    # 并行生成所有图片（上传由信号量控制串行，等待结果并行）
                     from concurrent.futures import ThreadPoolExecutor, as_completed
-                    results = []
                     success_count = 0
                     fail_count = 0
 
                     with ThreadPoolExecutor(max_workers=gacha_count_final) as executor:
-                        # 提交所有任务
                         futures = {executor.submit(generate_single_image, i): i for i in range(gacha_count_final)}
 
-                        # 按完成顺序处理结果
                         for future in as_completed(futures):
                             img_index, ok, result = future.result()
                             completed_count[0] += 1
@@ -825,6 +849,11 @@ class ChatChannel(Channel):
                     self._send_reply(context, end_reply)
 
                     logger.info(f"[chat_channel] GACHA completed: success={success_count}, fail={fail_count}")
+
+                    # 记录抽卡请求日志
+                    from common.request_log import log_request
+                    final_reply = Reply(ReplyType.TEXT, f"抽卡完成: 成功{success_count}张, 失败{fail_count}张")
+                    log_request(context, final_reply, pending.get("time"))
 
                 # 检查是否有最近的图片
                 recent_images = []

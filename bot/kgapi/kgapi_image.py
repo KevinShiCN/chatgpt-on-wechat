@@ -10,11 +10,16 @@ import time
 import os
 import re
 import socket
+import threading
 from common.log import logger
 from config import conf
+from requests_toolbelt import MultipartEncoder, MultipartEncoderMonitor
 
 # 设置socket默认超时时间（解决写入超时问题）
 socket.setdefaulttimeout(180)
+
+# 上传信号量：限制同时只有一个上传任务，避免并发上传导致超时
+_upload_semaphore = threading.Semaphore(1)
 
 # 支持的 aspect_ratio 值
 SUPPORTED_ASPECT_RATIOS = {
@@ -149,24 +154,19 @@ class KGAPIImage:
                 "Authorization": f"Bearer {api_key or self.api_key}"
             }
 
-            files = []
-            opened_files = []
-            total_size = 0
+            # 检查图片文件
+            valid_image = None
             for img_path in image_paths:
                 if os.path.exists(img_path):
                     file_size = os.path.getsize(img_path)
-                    total_size += file_size
                     logger.info(f"[KGAPI] loading image: {img_path}, size={file_size/1024:.1f}KB")
-                    f = open(img_path, 'rb')
-                    opened_files.append(f)
-                    files.append(("image", (os.path.basename(img_path), f, 'image/png')))
+                    valid_image = img_path
+                    break
                 else:
                     logger.warning(f"[KGAPI] image not found: {img_path}")
 
-            if not files:
+            if not valid_image:
                 return False, "参考图片文件不存在"
-
-            logger.info(f"[KGAPI] total upload size: {total_size/1024:.1f}KB")
 
             data = {
                 "model": self.model,
@@ -182,14 +182,46 @@ class KGAPIImage:
             logger.info(f"[KGAPI] sending request to {url}, model={self.model}, image_size={self.image_size}, aspect_ratio={aspect_ratio}")
             start_time = time.time()
 
-            # 增加超时时间：连接30秒，读取180秒（上传图片需要更长时间）
-            res = requests.post(url, headers=headers, files=files, data=data, timeout=(30, 180))
+            # 使用 MultipartEncoder 构建请求体
+            fields = dict(data)  # 复制 data 字典
+            fields['image'] = (os.path.basename(valid_image), open(valid_image, 'rb'), 'image/png')
+
+            encoder = MultipartEncoder(fields=fields)
+
+            # 上传完成标志
+            upload_completed = [False]
+
+            def upload_callback(monitor):
+                """上传进度回调，上传完成后释放信号量"""
+                if not upload_completed[0] and monitor.bytes_read >= monitor.len:
+                    upload_completed[0] = True
+                    upload_time = time.time() - start_time
+                    logger.info(f"[KGAPI] upload completed in {upload_time:.1f}s, waiting for server response...")
+                    _upload_semaphore.release()  # 释放信号量，允许下一个上传
+
+            monitor = MultipartEncoderMonitor(encoder, upload_callback)
+
+            # 获取上传信号量（等待其他上传完成）
+            logger.info(f"[KGAPI] waiting for upload slot...")
+            _upload_semaphore.acquire()
+            logger.info(f"[KGAPI] got upload slot, starting upload...")
+
+            try:
+                # 发送请求，上传完成后回调会释放信号量
+                res = requests.post(
+                    url,
+                    headers={**headers, 'Content-Type': monitor.content_type},
+                    data=monitor,
+                    timeout=(60, 300)  # 增加超时：上传60秒，等待响应300秒
+                )
+            except Exception as e:
+                # 如果请求失败且信号量未释放，需要释放
+                if not upload_completed[0]:
+                    _upload_semaphore.release()
+                raise
 
             elapsed = time.time() - start_time
             logger.info(f"[KGAPI] request completed in {elapsed:.1f}s, status={res.status_code}")
-
-            for f in opened_files:
-                f.close()
 
             res.raise_for_status()
 
@@ -210,14 +242,16 @@ class KGAPIImage:
             logger.info(f"[KGAPI] edit_img success, url={image_url}")
             return True, image_url
 
-        except requests.exceptions.Timeout as e:
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
             elapsed = time.time() - start_time if 'start_time' in locals() else 0
-            logger.error(f"[KGAPI] edit_img timeout after {elapsed:.1f}s: {e}")
+            error_type = "超时" if isinstance(e, requests.exceptions.Timeout) else "连接失败"
+            logger.error(f"[KGAPI] edit_img {error_type} after {elapsed:.1f}s: {e}")
             if retry_count < 2:
-                logger.info(f"[KGAPI] retrying edit_img ({retry_count + 1}/2)...")
-                time.sleep(2)
+                wait_time = 5 * (retry_count + 1)  # 5秒、10秒递增
+                logger.info(f"[KGAPI] retrying edit_img ({retry_count + 1}/2) after {wait_time}s...")
+                time.sleep(wait_time)
                 return self.edit_img(query, image_paths, retry_count + 1, api_key)
-            return False, f"图生图超时（已重试{retry_count}次），请联系管理员干饭CEO"
+            return False, f"图生图{error_type}（已重试{retry_count}次），请联系管理员干饭CEO"
         except requests.exceptions.RequestException as e:
             logger.error(f"[KGAPI] edit_img request error: {type(e).__name__}: {e}")
             return False, f"图生图请求失败: {str(e)}，请联系管理员干饭CEO"

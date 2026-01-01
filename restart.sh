@@ -42,6 +42,12 @@ fi
 # 3. 启动新进程
 echo ""
 echo "[3/3] 正在启动 app.py..."
+
+# 设置 NO_PROXY，让企业微信 API 不走代理
+export NO_PROXY="qyapi.weixin.qq.com,api.weixin.qq.com"
+export no_proxy="qyapi.weixin.qq.com,api.weixin.qq.com"
+echo "      已设置 NO_PROXY: $NO_PROXY"
+
 nohup python3 app.py > nohup.out 2>&1 &
 NEW_PID=$!
 sleep 2
